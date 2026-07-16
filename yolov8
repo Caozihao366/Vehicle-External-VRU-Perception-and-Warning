@@ -1,0 +1,64 @@
+import cv2
+from ultralytics import YOLO
+
+model = YOLO('yolov8s.pt')
+cap = cv2.VideoCapture(0)
+
+window_name = "VRU"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+CLASS_NAMES = {
+    0: "pedestrain",
+    1: "bicycle",
+    3: "motorcycle"
+}
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    
+    results = model.track(
+        frame,
+        device=0,
+        classes=[0, 1, 3],
+        conf=0.3,
+        tracker="bytetrack.yaml",
+        verbose=False
+    )
+    
+    annotated = frame.copy()
+    count = {"pedestrain": 0, "bicycle": 0, "motorcycle": 0}
+    
+    if results[0].boxes.id is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        ids = results[0].boxes.id.cpu().numpy().astype(int)
+        clses = results[0].boxes.cls.cpu().numpy().astype(int)
+        confs = results[0].boxes.conf.cpu().numpy()
+        
+        for box, track_id, cls, conf in zip(boxes, ids, clses, confs):
+            x1, y1, x2, y2 = map(int, box)
+            name = CLASS_NAMES.get(cls, "未知")
+            count[name] += 1
+            
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"ID:{track_id} {name} {conf:.0%}"
+            cv2.putText(annotated, label, (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
+    info_y = 30
+    for name, num in count.items():
+        cv2.putText(annotated, f"{name}: {num}", (20, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        info_y += 30
+    
+    cv2.imshow(window_name, annotated)
+    
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
