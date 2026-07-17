@@ -1,0 +1,323 @@
+import cv2
+import time
+import numpy as np
+from collections import deque
+from ultralytics import YOLO
+
+model = YOLO('yolov8s.pt')
+cap = cv2.VideoCapture(0)
+window_name = "VRU自运动补偿测试"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+CLASS_NAMES = {0: "pedestrian", 1: "bicycle", 3: "motorcycle"}
+
+orb = cv2.ORB_create(nfeatures=600, fastThreshold=20)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+MIN_MATCH_COUNT = 30
+
+global_kf = cv2.KalmanFilter(6, 3)
+global_kf.measurementMatrix = np.array([[1, 0, 0, 0, 0, 0],
+                                        [0, 1, 0, 0, 0, 0],
+                                        [0, 0, 1, 0, 0, 0]], np.float32)
+global_kf.transitionMatrix = np.array([[1, 0, 0, 1, 0, 0],
+                                       [0, 1, 0, 0, 1, 0],
+                                       [0, 0, 1, 0, 0, 1],
+                                       [0, 0, 0, 1, 0, 0],
+                                       [0, 0, 0, 0, 1, 0],
+                                       [0, 0, 0, 0, 0, 1]], np.float32)
+global_kf.processNoiseCov = np.diag([0.05, 0.05, 0.0005, 0.05, 0.05, 0.0005]).astype(np.float32)
+global_kf.measurementNoiseCov = np.diag([1.0, 1.0, 0.001]).astype(np.float32)
+
+track_history = {}      # key: track_id → [smooth_bx, smooth_by, speed_window, state, static_cnt, move_cnt, lost_cnt]
+SPEED_WINDOW_SIZE = 8
+BBOX_SMOOTH_ALPHA_LARGE = 0.4
+BBOX_SMOOTH_ALPHA_SMALL = 0.2
+NORM_STATIC_THRESHOLD = 0.3
+NORM_MOVE_THRESHOLD = 0.6
+STATIC_CONFIRM_FRAMES = 3
+MOVE_CONFIRM_FRAMES = 2
+
+SMALL_BBOX_H_THRESH = 60
+SMALL_MOVE_CONFIRM_EXTRA = 2
+
+RESIDUAL_SIGMA_MULT = 3.0
+DETECTION_JITTER_PX = 2.5
+MIN_RING_PX = 45
+MIN_LOCAL_PTS = 6
+
+# ============ 新增：漏检容忍帧数 ============
+MAX_LOST_FRAMES = 10
+
+prev_gray = None
+prev_kp = None
+prev_des = None
+prev_time = time.time()
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    current_time = time.time()
+    dt = max(current_time - prev_time, 0.001)
+    prev_time = current_time
+    h, w = frame.shape[:2]
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    annotated = frame.copy()
+
+    results = model.track(
+        frame, device=0, classes=[0, 1, 3], conf=0.3,   # 改为 cpu
+        tracker="bytetrack.yaml", verbose=False, persist=True
+    )
+
+    bg_mask = np.ones(gray.shape, dtype=np.uint8) * 255
+    current_tracks = set()
+    boxes_data = []
+
+    if results[0].boxes.id is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        ids = results[0].boxes.id.cpu().numpy().astype(int)
+        clses = results[0].boxes.cls.cpu().numpy().astype(int)
+
+        for box, track_id, cls in zip(boxes, ids, clses):
+            x1, y1, x2, y2 = map(int, box)
+            boxes_data.append((x1, y1, x2, y2, track_id, cls))
+            current_tracks.add(track_id)
+
+            mx1, my1 = max(0, x1 - 15), max(0, y1 - 15)
+            mx2, my2 = min(w, x2 + 15), min(h, y2 + 15)
+            bg_mask[my1:my2, mx1:mx2] = 0
+
+    kp, des = orb.detectAndCompute(gray, mask=bg_mask)
+
+    camera_moving = False
+    measured_dx, measured_dy, measured_angle = 0.0, 0.0, 0.0
+    bg_pts_curr = None
+    bg_pts_prev = None
+    sim_transform = None
+    bg_residual_px = 1.5
+
+    if prev_gray is not None and des is not None and prev_des is not None and len(kp) > 0:
+        matches = bf.knnMatch(prev_des, des, k=2)
+        good = []
+        for match in matches:
+            if len(match) == 2:
+                m, n = match
+                if m.distance < 0.75 * n.distance:
+                    good.append(m)
+
+        if len(good) > MIN_MATCH_COUNT:
+            src_pts = np.float32([prev_kp[m.queryIdx].pt for m in good]).reshape(-1, 2)
+            dst_pts = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 2)
+
+            sim_transform, mask_inliers = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
+            )
+
+            if sim_transform is not None:
+                inlier_mask = mask_inliers.ravel() == 1
+                bg_pts_prev = src_pts[inlier_mask]
+                bg_pts_curr = dst_pts[inlier_mask]
+
+                measured_dx = float(sim_transform[0, 2])
+                measured_dy = float(sim_transform[1, 2])
+                measured_angle = float(np.arctan2(sim_transform[1, 0], sim_transform[0, 0]))
+
+                if len(bg_pts_prev) > 0:
+                    proj = bg_pts_prev @ sim_transform[:, :2].T + sim_transform[:, 2]
+                    residuals = np.linalg.norm(proj - bg_pts_curr, axis=1)
+                    bg_residual_px = max(float(np.median(residuals)), 1.0)
+
+                if abs(measured_dx) > 1.0 or abs(measured_dy) > 1.0 or abs(measured_angle) > 0.01:
+                    camera_moving = True
+                else:
+                    measured_dx, measured_dy, measured_angle = 0.0, 0.0, 0.0
+
+    global_kf.predict()
+    if camera_moving:
+        measurement = np.array([[measured_dx], [measured_dy], [measured_angle]], dtype=np.float32)
+        global_kf.correct(measurement)
+    else:
+        measurement = np.zeros((3, 1), dtype=np.float32)
+        global_kf.correct(measurement)
+        global_kf.statePost[3:] = 0
+
+    smoothed_dx = global_kf.statePost[0, 0]
+    smoothed_dy = global_kf.statePost[1, 0]
+    smoothed_angle_rad = global_kf.statePost[2, 0]
+
+    cos_a = np.cos(smoothed_angle_rad)
+    sin_a = np.sin(smoothed_angle_rad)
+    M_smooth = np.array([
+        [cos_a, -sin_a, smoothed_dx],
+        [sin_a, cos_a, smoothed_dy]
+    ], dtype=np.float32)
+
+    prev_gray = gray.copy()
+    prev_kp, prev_des = kp, des
+
+    count = {"pedestrian": 0, "bicycle": 0, "motorcycle": 0}
+
+    # ----- 处理当前帧检测到的目标 -----
+    for (x1, y1, x2, y2, track_id, cls) in boxes_data:
+        raw_bx = (x1 + x2) // 2
+        raw_by = y2
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
+        name = CLASS_NAMES.get(cls, "unknown")
+        count[name] += 1
+
+        # ============ 新增：判断是否为大物体 ============
+        is_large = bbox_w > 100   # 像素宽度阈值，可调
+
+        smooth_alpha = BBOX_SMOOTH_ALPHA_SMALL if bbox_h < SMALL_BBOX_H_THRESH else BBOX_SMOOTH_ALPHA_LARGE
+
+        if track_id in track_history:
+            prev_bx, prev_by, speed_window, state, static_cnt, move_cnt, lost_cnt = track_history[track_id]
+            # 如果该目标之前处于丢失状态，但这次重新出现，则重置丢失计数，并平滑接回
+            if lost_cnt > 0:
+                # 可以稍微降低平滑权重，快速响应最新位置
+                smooth_alpha = min(0.6, smooth_alpha * 1.5)
+            smooth_bx = smooth_alpha * raw_bx + (1 - smooth_alpha) * prev_bx
+            smooth_by = smooth_alpha * raw_by + (1 - smooth_alpha) * prev_by
+            lost_cnt = 0   # 重置丢失计数
+        else:
+            smooth_bx, smooth_by = raw_bx, raw_by
+            speed_window = deque(maxlen=SPEED_WINDOW_SIZE)
+            state = "static"
+            static_cnt, move_cnt = 0, 0
+            lost_cnt = 0
+
+        instant_speed_norm = 0
+        bg_consistent = False
+        used_local = False
+
+        if track_id in track_history:
+            box_cx, box_cy = (x1 + x2) // 2, (y1 + y2) // 2
+            local_dx, local_dy = None, None
+
+            if bg_pts_curr is not None and bg_pts_prev is not None and len(bg_pts_prev) > 0:
+                dist_x = np.abs(bg_pts_prev[:, 0] - box_cx)
+                dist_y = np.abs(bg_pts_prev[:, 1] - box_cy)
+
+                ring_out_x = max(bbox_w * 1.5, MIN_RING_PX * 1.5)
+                ring_out_y = max(bbox_h * 1.5, MIN_RING_PX * 1.5)
+
+                nearby_mask = (dist_x < ring_out_x) & (dist_y < ring_out_y)
+                local_bg_prev = bg_pts_prev[nearby_mask]
+                local_bg_curr = bg_pts_curr[nearby_mask]
+
+                expand = 1.5
+                while len(local_bg_prev) < MIN_LOCAL_PTS and expand <= 3.0:
+                    nearby_mask = (dist_x < ring_out_x * expand) & (dist_y < ring_out_y * expand)
+                    local_bg_prev = bg_pts_prev[nearby_mask]
+                    local_bg_curr = bg_pts_curr[nearby_mask]
+                    expand += 0.5
+
+                if len(local_bg_prev) >= MIN_LOCAL_PTS:
+                    local_dx = float(np.median(local_bg_curr[:, 0] - local_bg_prev[:, 0]))
+                    local_dy = float(np.median(local_bg_curr[:, 1] - local_bg_prev[:, 1]))
+                    used_local = True
+
+                    rel_dx = (smooth_bx - prev_bx) - local_dx
+                    rel_dy = (smooth_by - prev_by) - local_dy
+                    local_rel_speed = np.sqrt(rel_dx ** 2 + rel_dy ** 2) / dt
+                    local_rel_speed_norm = local_rel_speed / max(bbox_h, 20)
+                    if local_rel_speed_norm < NORM_STATIC_THRESHOLD:
+                        bg_consistent = True
+
+            if used_local:
+                exp_bx = prev_bx + local_dx
+                exp_by = prev_by + local_dy
+            else:
+                P_prev = np.array([[prev_bx], [prev_by], [1.0]], dtype=np.float32)
+                P_exp = M_smooth @ P_prev
+                exp_bx, exp_by = float(P_exp[0, 0]), float(P_exp[1, 0])
+
+            real_dx = smooth_bx - exp_bx
+            real_dy = smooth_by - exp_by
+            comp_speed_pixels = np.sqrt(real_dx ** 2 + real_dy ** 2) / dt
+            instant_speed_norm = comp_speed_pixels / max(bbox_h, 20)
+
+            speed_window.append(instant_speed_norm)
+
+        avg_speed_norm = np.mean(speed_window) if len(speed_window) > 0 else 0
+
+        pixel_noise_floor = RESIDUAL_SIGMA_MULT * bg_residual_px + DETECTION_JITTER_PX
+        noise_floor_norm = (pixel_noise_floor / dt) / max(bbox_h, 20)
+        adaptive_static_thresh = max(NORM_STATIC_THRESHOLD, noise_floor_norm)
+        adaptive_move_thresh = max(NORM_MOVE_THRESHOLD, noise_floor_norm * 2.0)
+
+        # ============ 针对大物体放宽移动判定 ============
+        if is_large:
+            adaptive_move_thresh *= 1.8   # 大物体需要更明显的移动才判定为运动
+            move_confirm_needed = MOVE_CONFIRM_FRAMES + 2   # 需要更多帧确认
+        else:
+            move_confirm_needed = MOVE_CONFIRM_FRAMES
+
+        if bbox_h < SMALL_BBOX_H_THRESH:
+            move_confirm_needed += SMALL_MOVE_CONFIRM_EXTRA
+
+        if state == "static":
+            if avg_speed_norm > adaptive_move_thresh:
+                move_cnt += 1
+                static_cnt = 0
+                if move_cnt >= move_confirm_needed:
+                    state = "moving"
+            else:
+                move_cnt = 0
+        else:
+            if avg_speed_norm < adaptive_static_thresh or bg_consistent:
+                static_cnt += 1
+                move_cnt = 0
+                if static_cnt >= STATIC_CONFIRM_FRAMES:
+                    state = "static"
+            else:
+                static_cnt = 0
+
+        # 保存状态（添加 lost_cnt 字段）
+        track_history[track_id] = (smooth_bx, smooth_by, speed_window, state, static_cnt, move_cnt, lost_cnt)
+
+        box_color = (0, 255, 0) if state == "static" else (0, 0, 255)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
+        cv2.circle(annotated, (int(smooth_bx), int(smooth_by)), 4, (255, 255, 0), -1)
+
+        label = f"ID:{track_id} {state} v:{avg_speed_norm:.2f}/{adaptive_static_thresh:.2f}{'L' if used_local else 'G'}"
+        cv2.putText(annotated, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+    # ============ 处理漏检目标：不立即删除，维持一段时间 ============
+    for tid in list(track_history.keys()):
+        if tid not in current_tracks:
+            # 目标丢失，增加丢失计数
+            prev_bx, prev_by, speed_window, state, static_cnt, move_cnt, lost_cnt = track_history[tid]
+            lost_cnt += 1
+            if lost_cnt >= MAX_LOST_FRAMES:
+                # 丢失太久，删除历史
+                del track_history[tid]
+            else:
+                # 更新丢失计数，但保留其他状态不变（不更新位置）
+                track_history[tid] = (prev_bx, prev_by, speed_window, state, static_cnt, move_cnt, lost_cnt)
+
+    # 显示信息
+    info_y = 30
+    smoothed_angle_deg = smoothed_angle_rad * 180 / np.pi
+    cam_text = (f"Cam: {'MOVING' if camera_moving else 'STATIC'} "
+                f"dx={smoothed_dx:.1f} dy={smoothed_dy:.1f} angle={smoothed_angle_deg:.2f} "
+                f"res={bg_residual_px:.1f}px")
+    cv2.putText(annotated, cam_text, (20, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    info_y += 30
+    for name, num in count.items():
+        cv2.putText(annotated, f"{name}: {num}", (20, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        info_y += 30
+    cv2.putText(annotated, "Green: static | Red: moving  (L=local bg disp, G=global affine fallback)",
+                (20, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    cv2.imshow(window_name, annotated)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
