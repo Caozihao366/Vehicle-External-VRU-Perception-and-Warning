@@ -16,7 +16,13 @@ def draw_results(frame, results, motion_state, camera_moving, dx, dy, angle_deg,
         used_local = 'L' if obj['used_local'] else 'G'
         bx, by = obj['bottom_center']
 
-        box_color = (0, 255, 0) if state == "static" else (0, 0, 255)
+        track_state = obj['track_state']
+        if track_state == TRACK_STATE_NEW:
+            box_color = (0, 255, 255)  # 新生轨迹黄色
+        elif track_state == TRACK_STATE_LOST:
+            box_color = (128, 128, 128) # 遮挡灰色
+        else:
+            box_color = (0, 255, 0) if obj['state'] == "static" else (0, 0, 255)
         cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
         cv2.circle(annotated, (int(bx), int(by)), 4, (255, 255, 0), -1)
         
