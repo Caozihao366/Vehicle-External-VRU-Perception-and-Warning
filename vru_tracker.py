@@ -3,7 +3,6 @@ import numpy as np
 from collections import deque
 from config import *
 
-# 移到类外面，工具函数
 def create_obj_kf(init_cx, init_cy, init_w, init_h):
     """创建单个目标的卡尔曼滤波器，状态：[cx, cy, w, h, vx, vy]"""
     kf = cv2.KalmanFilter(6, 4)
@@ -26,10 +25,9 @@ def create_obj_kf(init_cx, init_cy, init_w, init_h):
     kf.statePost = np.array([[init_cx], [init_cy], [init_w], [init_h], [0], [0]], np.float32)
     return kf
 
-
 class VRUTracker:
     def __init__(self):
-        self.track_history = {}  # key: track_id → 轨迹字典
+        self.track_history = {}
 
     def _calc_local_bg_disp(self, box_cx, box_cy, bbox_w, bbox_h, bg_pts_prev, bg_pts_curr):
         """计算目标周围局部背景的平均位移"""
@@ -70,16 +68,8 @@ class VRUTracker:
             is_small = bbox_h < SMALL_BBOX_H_THRESH
             smooth_alpha = BBOX_SMOOTH_ALPHA_SMALL if is_small else BBOX_SMOOTH_ALPHA_LARGE
 
-            instant_speed_norm = 0
-            bg_consistent = False
-            used_local = False
-            avg_speed_norm = 0
-            adaptive_static_thresh = NORM_STATIC_THRESHOLD
-            adaptive_move_thresh = NORM_MOVE_THRESHOLD
-            move_confirm_needed = MOVE_CONFIRM_FRAMES
-
             if track_id in self.track_history:
-                # 已存在的目标，更新
+                # 已存在目标
                 track = self.track_history[track_id]
                 prev_bx = track['smooth_bx']
                 prev_by = track['smooth_by']
@@ -97,7 +87,10 @@ class VRUTracker:
                 smooth_by = smooth_alpha * raw_by + (1 - smooth_alpha) * prev_by
                 lost_cnt = 0
 
-                # 计算速度和运动补偿
+                # 运动补偿计算速度
+                instant_speed_norm = 0
+                bg_consistent = False
+                used_local = False
                 box_cx, box_cy = (x1 + x2) // 2, (y1 + y2) // 2
                 local_dx, local_dy = self._calc_local_bg_disp(box_cx, box_cy, bbox_w, bbox_h, bg_pts_prev, bg_pts_curr)
                 
@@ -130,7 +123,7 @@ class VRUTracker:
                 adaptive_static_thresh = max(NORM_STATIC_THRESHOLD, noise_floor_norm)
                 adaptive_move_thresh = max(NORM_MOVE_THRESHOLD, noise_floor_norm * 2.0)
 
-                # 大小目标阈值调整
+                move_confirm_needed = MOVE_CONFIRM_FRAMES
                 if is_large:
                     adaptive_move_thresh *= LARGE_MOVE_THRESH_MULT
                     move_confirm_needed += LARGE_MOVE_CONFIRM_EXTRA
@@ -171,12 +164,23 @@ class VRUTracker:
                 track['static_thresh'] = adaptive_static_thresh
                 track['used_local'] = used_local
                 track['hit_cnt'] += 1
-                # 连续3帧转正
                 if track['state'] == TRACK_STATE_NEW and track['hit_cnt'] >= TRACK_NEW_CONFIRM_FRAMES:
                     track['state'] = TRACK_STATE_STABLE
 
+                results.append({
+                    'track_id': track_id,
+                    'cls': cls,
+                    'track_state': track['state'],
+                    'bbox': (x1, y1, x2, y2),
+                    'bottom_center': (smooth_bx, smooth_by),
+                    'state': state,
+                    'speed_norm': avg_speed_norm,
+                    'static_thresh': adaptive_static_thresh,
+                    'used_local': used_local
+                })
+
             else:
-                # 新目标第一次出现，初始化
+                # 新目标初始化
                 raw_cx = (x1 + x2) / 2
                 raw_cy = (y1 + y2) / 2
                 self.track_history[track_id] = {
@@ -184,7 +188,7 @@ class VRUTracker:
                     'cls': cls,
                     'state': TRACK_STATE_NEW,
                     'kf': create_obj_kf(raw_cx, raw_cy, bbox_w, bbox_h),
-                    'hit_cnt': 0,  # 初始0，后面加1变成1
+                    'hit_cnt': 0,
                     'lost_cnt': 0,
                     'bbox': (x1, y1, x2, y2),
                     'bottom_center': (raw_bx, raw_by),
@@ -204,17 +208,18 @@ class VRUTracker:
                 smooth_bx, smooth_by = raw_bx, raw_by
                 track['hit_cnt'] += 1
 
-            results.append({
-                'track_id': track_id,
-                'cls': cls,
-                'track_state': track['state'],
-                'bbox': (x1, y1, x2, y2),
-                'bottom_center': (smooth_bx, smooth_by),
-                'state': track['motion_state'],
-                'speed_norm': avg_speed_norm,
-                'static_thresh': adaptive_static_thresh,
-                'used_local': used_local
-            })
+                results.append({
+                    'track_id': track_id,
+                    'cls': cls,
+                    'track_state': track['state'],
+                    'bbox': (x1, y1, x2, y2),
+                    'bottom_center': (smooth_bx, smooth_by),
+                    'state': 'static',
+                    'speed_norm': 0,
+                    'static_thresh': NORM_STATIC_THRESHOLD,
+                    'used_local': False
+                })
+                continue
 
         # 漏检外推
         for tid in list(self.track_history.keys()):
