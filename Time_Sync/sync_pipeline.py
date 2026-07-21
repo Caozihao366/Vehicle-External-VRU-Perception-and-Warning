@@ -1,13 +1,9 @@
 """
-FR-01: 真正的多相机时间对齐
+FR-01: 多相机时间对齐
 
-核心算法（与数据集无关，可复用到本地图/真机）：
-  四路各自一条 (image, timestamp) 队列
-  → 选基准时刻（默认 front 队列）
-  → 在其余队列做最近邻匹配
-  → 输出多帧组，并按毫秒阈值判定 available / degraded / unavailable
-
-nuScenes 只负责「灌队列」，不再直接使用 sample 预绑定的多相机组。
+本文件只包含时间对齐与 JSON 输出，不读取任何数据集。
+数据集读取器（例如 NuScenesDatasetSource）必须位于本文件之外，
+并提供 iter_scenes() 返回统一的场景字典。
 """
 
 from __future__ import annotations
@@ -18,16 +14,15 @@ from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from pyquaternion import Quaternion
 
-from nuscenes.nuscenes import NuScenes
-
 TZ_UTC8 = timezone(timedelta(hours=8))
 
-DEFAULT_CAMERA_MAP = {
+# 逻辑名 → 交接 JSON 中的相机键（可改；默认沿用常见环视命名）
+DEFAULT_OUTPUT_CAMERA_MAP = {
     "front": "CAM_FRONT",
     "left": "CAM_FRONT_LEFT",
     "right": "CAM_FRONT_RIGHT",
@@ -36,12 +31,12 @@ DEFAULT_CAMERA_MAP = {
 
 
 # ======================================================================
-# 通用数据结构 + 时间对齐算法（硬件无关）
+# 时间对齐算法（硬件 / 数据集无关）
 # ======================================================================
 
 @dataclass
 class Frame:
-    """一路相机上的一帧。真机/本地图只要填这三项即可。"""
+    """一路相机上的一帧。数据集读取函数只需提供 path / timestamp_us。"""
 
     camera: str
     path: str
@@ -111,7 +106,6 @@ class TemporalAligner:
         else:
             us_list = [f.timestamp_us for f in present]
             max_spread = (max(us_list) - min(us_list)) / 1000.0
-            # 也要求每路相对基准的偏差不超过阈值
             max_delta = max(deltas.values()) if deltas else float("inf")
             if max_spread > self.tolerance_ms or max_delta > self.tolerance_ms:
                 quality = "degraded"
@@ -145,29 +139,26 @@ class TemporalAligner:
 
 
 def demo_temporal_aligner(tolerance_ms: float = 35.0) -> None:
-    """
-    不依赖数据集的自检：人为制造时间偏移，验证最近邻是否找对。
-    只打印到终端。
-    """
+    """不依赖数据集的自检：人造时间偏移，验证最近邻。"""
     print("=" * 60)
-    print("时间对齐算法自检（本地模拟队列，非 nuScenes）")
+    print("时间对齐算法自检（模拟队列）")
     base = 1_000_000_000_000
     streams = {
         "front": [
             Frame("front", "f0.jpg", base),
-            Frame("front", "f1.jpg", base + 100_000),  # +100ms
+            Frame("front", "f1.jpg", base + 100_000),
         ],
         "left": [
-            Frame("left", "l0.jpg", base + 8_000),  # +8ms → 应匹配 f0
+            Frame("left", "l0.jpg", base + 8_000),
             Frame("left", "l1.jpg", base + 108_000),
         ],
         "right": [
-            Frame("right", "r0.jpg", base + 12_000),  # +12ms
+            Frame("right", "r0.jpg", base + 12_000),
             Frame("right", "r1.jpg", base + 112_000),
         ],
         "rear": [
-            Frame("rear", "b0.jpg", base + 25_000),  # +25ms
-            Frame("rear", "b1.jpg", base + 90_000),  # 更靠近 f1? 对 f0 仍应选 b0
+            Frame("rear", "b0.jpg", base + 25_000),
+            Frame("rear", "b1.jpg", base + 90_000),
         ],
     }
     aligner = TemporalAligner(tolerance_ms=tolerance_ms, base_camera="front")
@@ -184,7 +175,6 @@ def demo_temporal_aligner(tolerance_ms: float = 35.0) -> None:
     print(f"  spread      : {g0.max_spread_ms:.3f} ms  quality={g0.quality}")
     print(f"  自检结果    : {'PASS' if ok else 'FAIL'}")
 
-    # 超阈值：rear 故意偏 80ms
     streams_bad = {
         "front": [Frame("front", "f0.jpg", base)],
         "left": [Frame("left", "l0.jpg", base + 5_000)],
@@ -200,46 +190,45 @@ def demo_temporal_aligner(tolerance_ms: float = 35.0) -> None:
 
 
 # ======================================================================
-# SyncPipeline：灌队列（nuScenes）+ 调用对齐器 + 组装附录 A JSON
+# SyncPipeline：只依赖任意提供 iter_scenes() 的数据集读取器
 # ======================================================================
 
 class SyncPipeline:
     def __init__(
         self,
-        dataroot: str = "./data",
-        version: str = "v1.0-mini",
+        source: Any,
         output_json: str = "fr01_sync_output.json",
         sync_tolerance_ms: float = 35.0,
-        camera_map: Optional[Dict[str, str]] = None,
+        output_camera_map: Optional[Dict[str, str]] = None,
         base_camera: str = "front",
-        # keyframe≈0.5s一帧; interval=包内多帧; all≈相机全帧率
+        # keyframe=meta.is_key_frame; interval=包内抽样; all=基准相机全帧
         ref_mode: str = "interval",
         ref_interval_ms: float = 100.0,
+        require_ego: bool = False,
         verbose: bool = True,
     ) -> None:
-        self.dataroot = dataroot
-        self.version = version
+        self.source = source
         self.output_json = output_json
         self.sync_tolerance_ms = sync_tolerance_ms
-        self.camera_map = dict(camera_map or DEFAULT_CAMERA_MAP)
+        self.output_camera_map = dict(
+            output_camera_map or DEFAULT_OUTPUT_CAMERA_MAP
+        )
         self.base_camera = base_camera
         self.ref_mode = ref_mode
         self.ref_interval_ms = ref_interval_ms
+        self.require_ego = require_ego
         self.max_pose_gap_s = 0.5
         self.verbose = verbose
-        self.nusc: Optional[NuScenes] = None
         self.aligner = TemporalAligner(
             tolerance_ms=sync_tolerance_ms, base_camera=base_camera
         )
 
     def run(self, save: bool = True) -> List[dict]:
-        self._ensure_nusc()
-        assert self.nusc is not None
-
         if self.verbose:
             print("=" * 60)
-            print("FR-01 真正时间对齐：独立队列 + 最近邻匹配")
-            print(f"相机: {self.camera_map}")
+            print("FR-01 时间对齐：数据集读取器 → 最近邻匹配")
+            print(f"source = {type(self.source).__name__}")
+            print(f"output_cameras = {self.output_camera_map}")
             print(f"sync_tolerance_ms = {self.sync_tolerance_ms}")
             print(f"ref_mode = {self.ref_mode}", end="")
             if self.ref_mode == "interval":
@@ -249,32 +238,22 @@ class SyncPipeline:
             print("=" * 60)
 
         outputs: List[dict] = []
-        differ_from_bundle = 0
-        compared_to_bundle = 0
         total_groups = 0
         qualities: List[str] = []
         spreads: List[float] = []
         ego_ok = 0
 
-        for scene in self.nusc.scene:
-            streams = self._build_camera_streams(scene)
-            ref_times = self._select_ref_times(streams, scene)
-            kin_ts, kin_speed, kin_yaw = self._scene_kinematics(scene)
+        for scene in self.source.iter_scenes():
+            streams = self._to_frame_streams(scene["streams"])
+            ref_times = self._select_ref_times(streams)
+            kin_ts, kin_speed, kin_yaw = self._build_kinematics(
+                scene.get("ego_poses") or []
+            )
             groups = self.aligner.align(streams, ref_times)
-
-            keyframe_map = None
-            if self.ref_mode == "keyframe":
-                keyframe_map = {t: tok for t, tok in self._base_keyframe_refs(scene)}
 
             scene_out = []
             for group in groups:
                 total_groups += 1
-                if keyframe_map is not None:
-                    sample_token = keyframe_map.get(group.ref_timestamp_us)
-                    if sample_token:
-                        compared_to_bundle += 1
-                        if self._differs_from_sample_bundle(sample_token, group):
-                            differ_from_bundle += 1
                 item = self._to_output_json(group, kin_ts, kin_speed, kin_yaw)
                 scene_out.append(item)
                 qualities.append(item["sensor_availability"])
@@ -286,10 +265,9 @@ class SyncPipeline:
             outputs.extend(scene_out)
             if self.verbose:
                 qlen = {k: len(v) for k, v in streams.items()}
-                n_key = len(self._base_keyframe_refs(scene))
                 print(
-                    f"{scene['name']}: queues={qlen}, "
-                    f"keyframes={n_key}, aligned_groups={len(scene_out)}"
+                    f"{scene.get('name', 'unnamed')}: "
+                    f"queues={qlen}, aligned_groups={len(scene_out)}"
                 )
 
         if save:
@@ -297,14 +275,10 @@ class SyncPipeline:
             with out_path.open("w", encoding="utf-8") as f:
                 json.dump(outputs, f, ensure_ascii=False, indent=2)
             if self.verbose:
-                self.print_report(
-                    out_path, qualities, spreads, ego_ok,
-                    differ_from_bundle, compared_to_bundle, total_groups,
-                )
+                self.print_report(out_path, qualities, spreads, ego_ok, total_groups)
         elif self.verbose:
             self.print_report(
-                Path(self.output_json), qualities, spreads, ego_ok,
-                differ_from_bundle, compared_to_bundle, total_groups,
+                Path(self.output_json), qualities, spreads, ego_ok, total_groups
             )
 
         return outputs
@@ -315,21 +289,20 @@ class SyncPipeline:
         qualities: List[str],
         spreads: List[float],
         ego_ok: int = 0,
-        differ_from_bundle: int = 0,
-        compared_to_bundle: int = 0,
         total_groups: int = 0,
     ) -> None:
         status_count = {"available": 0, "degraded": 0, "unavailable": 0}
         for q in qualities:
             status_count[q] = status_count.get(q, 0) + 1
 
-        n = len(qualities)
+        n = len(qualities) or total_groups
         spreads_arr = np.asarray(spreads, dtype=float) if spreads else np.array([0.0])
         avail_ratio = status_count.get("available", 0) / n if n else 0.0
 
         print("-" * 60)
         print("终端验收摘要（最近邻时间对齐）")
         print(f"  对齐算法       : 多路独立队列 + 基准时刻最近邻")
+        print(f"  输入接口       : {type(self.source).__name__}")
         print(f"  抽样模式       : {self.ref_mode}", end="")
         if self.ref_mode == "interval":
             print(f" @ {self.ref_interval_ms} ms")
@@ -349,24 +322,26 @@ class SyncPipeline:
             f"P99={float(np.percentile(spreads_arr, 99)):.3f}, "
             f"Max={float(spreads_arr.max()):.3f}"
         )
-        if compared_to_bundle:
-            print(f"  与 sample 预绑定不同: {differ_from_bundle}/{compared_to_bundle}")
         if out_path is not None:
             print(f"  JSON 路径      : {out_path.resolve()}")
         print("-" * 60)
 
-    def _select_ref_times(
-        self, streams: Dict[str, List[Frame]], scene: dict
-    ) -> List[int]:
-        """选择对齐基准时刻：决定每个 0.5s 窗口内取几组。"""
-        if self.ref_mode == "keyframe":
-            return [t for t, _ in self._base_keyframe_refs(scene)]
-
-        base_q = streams[self.base_camera]
+    def _select_ref_times(self, streams: Dict[str, List[Frame]]) -> List[int]:
+        base_q = streams.get(self.base_camera, [])
         if not base_q:
             return []
+
+        if self.ref_mode == "keyframe":
+            keyed = [
+                f.timestamp_us
+                for f in base_q
+                if f.meta.get("is_key_frame")
+            ]
+            return keyed if keyed else [f.timestamp_us for f in base_q]
+
         if self.ref_mode == "all":
             return [f.timestamp_us for f in base_q]
+
         if self.ref_mode != "interval":
             raise ValueError(
                 f"未知 ref_mode={self.ref_mode!r}，可选 keyframe|interval|all"
@@ -381,75 +356,31 @@ class SyncPipeline:
                 next_t = fr.timestamp_us + step
         return refs
 
-    # ------------------------------------------------------------------
-    # nuScenes → 独立队列
-    # ------------------------------------------------------------------
-
-    def _ensure_nusc(self) -> None:
-        if self.nusc is None:
-            self.nusc = NuScenes(
-                version=self.version, dataroot=self.dataroot, verbose=False
-            )
-
-    def _build_camera_streams(self, scene: dict) -> Dict[str, List[Frame]]:
-        """每路相机沿 sample_data 链表收集全量帧（含非 keyframe），形成独立队列。"""
-        assert self.nusc is not None
-        sample0 = self.nusc.get("sample", scene["first_sample_token"])
+    @staticmethod
+    def _to_frame_streams(
+        raw_streams: Mapping[str, Sequence[Mapping[str, Any]]]
+    ) -> Dict[str, List[Frame]]:
+        """把读取器输出的标准字典转换为对齐算法所需的 Frame 队列。"""
         streams: Dict[str, List[Frame]] = {}
-
-        for cam_key, channel in self.camera_map.items():
-            sd_token = sample0["data"][channel]
-            # 回到该相机链起点
-            while True:
-                sd = self.nusc.get("sample_data", sd_token)
-                if sd["prev"] == "":
-                    break
-                sd_token = sd["prev"]
-
+        for camera, entries in raw_streams.items():
             frames: List[Frame] = []
-            while sd_token != "":
-                sd = self.nusc.get("sample_data", sd_token)
+            for index, entry in enumerate(entries):
+                if "path" not in entry or "timestamp_us" not in entry:
+                    raise ValueError(
+                        f"camera={camera!r} index={index}: "
+                        "每帧必须提供 path 与 timestamp_us"
+                    )
                 frames.append(
                     Frame(
-                        camera=cam_key,
-                        path=sd["filename"],
-                        timestamp_us=sd["timestamp"],
-                        token=sd["token"],
-                        meta={"is_key_frame": bool(sd["is_key_frame"])},
+                        camera=camera,
+                        path=str(entry["path"]),
+                        timestamp_us=int(entry["timestamp_us"]),
+                        token=str(entry.get("token", "")),
+                        meta=dict(entry.get("meta") or {}),
                     )
                 )
-                sd_token = sd["next"]
-
-            frames.sort(key=lambda f: f.timestamp_us)
-            streams[cam_key] = frames
-
+            streams[camera] = sorted(frames, key=lambda frame: frame.timestamp_us)
         return streams
-
-    def _base_keyframe_refs(self, scene: dict) -> List[Tuple[int, str]]:
-        """返回 [(front_keyframe_timestamp_us, sample_token), ...]"""
-        assert self.nusc is not None
-        refs: List[Tuple[int, str]] = []
-        sample_token = scene["first_sample_token"]
-        channel = self.camera_map[self.base_camera]
-        while sample_token != "":
-            sample = self.nusc.get("sample", sample_token)
-            sd = self.nusc.get("sample_data", sample["data"][channel])
-            refs.append((sd["timestamp"], sample["token"]))
-            sample_token = sample["next"]
-        return refs
-
-    def _differs_from_sample_bundle(self, sample_token: str, group: SyncGroup) -> bool:
-        """最近邻选中的路径是否不同于 nuScenes sample 预绑定。"""
-        assert self.nusc is not None
-        sample = self.nusc.get("sample", sample_token)
-        for cam_key, channel in self.camera_map.items():
-            matched = group.frames.get(cam_key)
-            if matched is None:
-                return True
-            bundled = self.nusc.get("sample_data", sample["data"][channel])
-            if matched.path != bundled["filename"]:
-                return True
-        return False
 
     def _to_output_json(
         self,
@@ -458,18 +389,20 @@ class SyncPipeline:
         kin_speed: np.ndarray,
         kin_yaw: np.ndarray,
     ) -> dict:
-        """附录 A 字段 + 各相机 frames(path/timestamp/delta_ms)。"""
         t_start = time.perf_counter()
         base_us = group.ref_timestamp_us
+        has_ego_track = len(kin_ts) > 0
         ego = self._interpolate_ego(kin_ts, kin_speed, kin_yaw, base_us)
 
         quality = group.quality
         if ego is None:
-            quality = "unavailable"
+            if self.require_ego or has_ego_track:
+                # 有轨迹却插值失败，或调用方强制要求 ego → unavailable
+                quality = "unavailable"
             ego = {"speed_kmh": None, "yaw_rate": None}
 
         frames_out: Dict[str, dict] = {}
-        for logical_name, sensor_name in self.camera_map.items():
+        for logical_name, sensor_name in self.output_camera_map.items():
             fr = group.frames.get(logical_name)
             if fr is None:
                 continue
@@ -505,34 +438,8 @@ class SyncPipeline:
             },
         }
 
-    def _scene_kinematics(
-        self, scene: dict
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        return self._build_kinematics(self._collect_ego_poses(scene))
-
-    def _collect_ego_poses(self, scene: dict) -> List[dict]:
-        assert self.nusc is not None
-        sample = self.nusc.get("sample", scene["first_sample_token"])
-        sd_token = sample["data"]["LIDAR_TOP"]
-        while True:
-            sd = self.nusc.get("sample_data", sd_token)
-            if sd["prev"] == "":
-                break
-            sd_token = sd["prev"]
-
-        poses, seen = [], set()
-        while sd_token != "":
-            sd = self.nusc.get("sample_data", sd_token)
-            ep = self.nusc.get("ego_pose", sd["ego_pose_token"])
-            if ep["token"] not in seen:
-                seen.add(ep["token"])
-                poses.append(ep)
-            sd_token = sd["next"]
-        poses.sort(key=lambda p: p["timestamp"])
-        return poses
-
     def _build_kinematics(
-        self, ego_poses: List[dict]
+        self, ego_poses: Sequence[Mapping[str, Any]]
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if len(ego_poses) < 2:
             return np.array([]), np.array([]), np.array([])
@@ -540,16 +447,17 @@ class SyncPipeline:
         ts, speeds, yaw_rates = [], [], []
         for i in range(len(ego_poses) - 1):
             p0, p1 = ego_poses[i], ego_poses[i + 1]
-            dt = (p1["timestamp"] - p0["timestamp"]) * 1e-6
+            dt = (int(p1["timestamp_us"]) - int(p0["timestamp_us"])) * 1e-6
             if dt <= 1e-6:
                 continue
             dist = np.linalg.norm(
-                np.array(p1["translation"]) - np.array(p0["translation"])
+                np.asarray(p1["translation"], dtype=float)
+                - np.asarray(p0["translation"], dtype=float)
             )
-            yaw0 = Quaternion(p0["rotation"]).yaw_pitch_roll[0]
-            yaw1 = Quaternion(p1["rotation"]).yaw_pitch_roll[0]
+            yaw0 = Quaternion(list(p0["rotation"])).yaw_pitch_roll[0]
+            yaw1 = Quaternion(list(p1["rotation"])).yaw_pitch_roll[0]
             dyaw = (yaw1 - yaw0 + np.pi) % (2 * np.pi) - np.pi
-            ts.append(p0["timestamp"])
+            ts.append(int(p0["timestamp_us"]))
             speeds.append(dist / dt * 3.6)
             yaw_rates.append(dyaw / dt)
         return (
@@ -595,18 +503,8 @@ class SyncPipeline:
 
     @staticmethod
     def _us_to_iso8601(timestamp_us: int) -> str:
-        """ISO8601，含毫秒与 +08:00。"""
         dt = datetime.fromtimestamp(
             timestamp_us / 1e6, tz=timezone.utc
         ).astimezone(TZ_UTC8)
         return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+08:00"
 
-
-if __name__ == "__main__":
-    demo_temporal_aligner(tolerance_ms=40.0)
-    # keyframe≈0.5s一帧；interval=100ms → 每个标注间隔内约 5 组；all≈12Hz全量
-    SyncPipeline(
-        sync_tolerance_ms=50.0,
-        ref_mode="interval",
-        ref_interval_ms=5.0,
-    ).run()
