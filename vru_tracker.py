@@ -4,21 +4,13 @@ from collections import deque
 from config import *
 
 def create_obj_kf(init_cx, init_cy, init_w, init_h):
-    """创建单个目标的卡尔曼滤波器，状态：[cx, cy, w, h, vx, vy]"""
     kf = cv2.KalmanFilter(6, 4)
     kf.measurementMatrix = np.array([
-        [1,0,0,0,0,0],
-        [0,1,0,0,0,0],
-        [0,0,1,0,0,0],
-        [0,0,0,1,0,0]
+        [1,0,0,0,0,0],[0,1,0,0,0,0],[0,0,1,0,0,0],[0,0,0,1,0,0]
     ], np.float32)
     kf.transitionMatrix = np.array([
-        [1,0,0,0,1,0],
-        [0,1,0,0,0,1],
-        [0,0,1,0,0,0],
-        [0,0,0,1,0,0],
-        [0,0,0,0,1,0],
-        [0,0,0,0,0,1]
+        [1,0,0,0,1,0],[0,1,0,0,0,1],[0,0,1,0,0,0],[0,0,0,1,0,0],
+        [0,0,0,0,1,0],[0,0,0,0,0,1]
     ], np.float32)
     kf.processNoiseCov = np.eye(6, dtype=np.float32) * OBJ_KF_PROCESS_NOISE
     kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * OBJ_KF_MEASURE_NOISE
@@ -30,16 +22,12 @@ class VRUTracker:
         self.track_history = {}
 
     def _calc_local_bg_disp(self, box_cx, box_cy, bbox_w, bbox_h, bg_pts_prev, bg_pts_curr):
-        """计算目标周围局部背景的平均位移"""
         if bg_pts_prev is None or len(bg_pts_prev) == 0:
             return None, None
-        
         dist_x = np.abs(bg_pts_prev[:, 0] - box_cx)
         dist_y = np.abs(bg_pts_prev[:, 1] - box_cy)
-        
         ring_out_x = max(bbox_w * LOCAL_RING_INIT, MIN_RING_PX * LOCAL_RING_INIT)
         ring_out_y = max(bbox_h * LOCAL_RING_INIT, MIN_RING_PX * LOCAL_RING_INIT)
-        
         expand = LOCAL_RING_INIT
         local_bg_prev, local_bg_curr = [], []
         while len(local_bg_prev) < MIN_LOCAL_PTS and expand <= LOCAL_RING_MAX:
@@ -47,15 +35,13 @@ class VRUTracker:
             local_bg_prev = bg_pts_prev[nearby_mask]
             local_bg_curr = bg_pts_curr[nearby_mask]
             expand += 0.5
-        
         if len(local_bg_prev) >= MIN_LOCAL_PTS:
             local_dx = float(np.median(local_bg_curr[:, 0] - local_bg_prev[:, 0]))
             local_dy = float(np.median(local_bg_curr[:, 1] - local_bg_prev[:, 1]))
             return local_dx, local_dy
         return None, None
 
-    def update(self, boxes_data, dt, M_smooth, bg_pts_prev, bg_pts_curr, bg_residual_px):
-        """更新所有目标的状态，返回目标结果列表"""
+    def update(self, boxes_data, keypoints_data, dt, M_smooth, bg_pts_prev, bg_pts_curr, bg_residual_px):
         current_tracks = set()
         results = []
 
@@ -66,13 +52,13 @@ class VRUTracker:
             bbox_w, bbox_h = x2 - x1, y2 - y1
             is_large = bbox_w > LARGE_BBOX_W_THRESH
             is_small = bbox_h < SMALL_BBOX_H_THRESH
-            smooth_alpha = BBOX_SMOOTH_ALPHA_SMALL if is_small else BBOX_SMOOTH_ALPHA_LARGE
+            base_alpha = BBOX_SMOOTH_ALPHA_SMALL if is_small else BBOX_SMOOTH_ALPHA_LARGE
+            kps = keypoints_data.get(track_id, None)
 
             if track_id in self.track_history:
-                # 已存在目标
                 track = self.track_history[track_id]
-                prev_bx = track['smooth_bx']
-                prev_by = track['smooth_by']
+                prev_raw_bx = track['raw_bx']
+                prev_raw_by = track['raw_by']
                 speed_window = track['speed_window']
                 state = track['motion_state']
                 static_cnt = track['static_cnt']
@@ -81,48 +67,65 @@ class VRUTracker:
                 last_vx = track['last_vx']
                 last_vy = track['last_vy']
 
+                # 坐标平滑仅用于显示，运动目标减少平滑
+                smooth_alpha = base_alpha
                 if lost_cnt > 0:
-                    smooth_alpha = min(0.6, smooth_alpha * 1.5)
-                smooth_bx = smooth_alpha * raw_bx + (1 - smooth_alpha) * prev_bx
-                smooth_by = smooth_alpha * raw_by + (1 - smooth_alpha) * prev_by
+                    smooth_alpha = min(0.7, smooth_alpha * 1.5)
+                elif state == "moving":
+                    smooth_alpha = 0.7
+                smooth_bx = smooth_alpha * raw_bx + (1 - smooth_alpha) * track['smooth_bx']
+                smooth_by = smooth_alpha * raw_by + (1 - smooth_alpha) * track['smooth_by']
                 lost_cnt = 0
 
-                # 运动补偿计算速度
+                # 速度计算
                 instant_speed_norm = 0
                 bg_consistent = False
                 used_local = False
                 box_cx, box_cy = (x1 + x2) // 2, (y1 + y2) // 2
-                local_dx, local_dy = self._calc_local_bg_disp(box_cx, box_cy, bbox_w, bbox_h, bg_pts_prev, bg_pts_curr)
-                
-                if local_dx is not None:
-                    used_local = True
-                    exp_bx = prev_bx + local_dx
-                    exp_by = prev_by + local_dy
-                    rel_dx = (smooth_bx - prev_bx) - local_dx
-                    rel_dy = (smooth_by - prev_by) - local_dy
-                    local_rel_speed = np.sqrt(rel_dx**2 + rel_dy**2) / dt
-                    local_rel_speed_norm = local_rel_speed / max(bbox_h, 20)
-                    if local_rel_speed_norm < NORM_STATIC_THRESHOLD:
-                        bg_consistent = True
-                else:
-                    P_prev = np.array([[prev_bx], [prev_by], [1.0]], dtype=np.float32)
-                    P_exp = M_smooth @ P_prev
-                    exp_bx, exp_by = float(P_exp[0, 0]), float(P_exp[1, 0])
 
-                real_dx = smooth_bx - exp_bx
-                real_dy = smooth_by - exp_by
-                comp_speed_pixels = np.sqrt(real_dx**2 + real_dy**2) / dt
+                if FIXED_CAMERA:
+                    inst_dx = raw_bx - prev_raw_bx
+                    inst_dy = raw_by - prev_raw_by
+                    used_local = False
+                else:
+                    local_dx, local_dy = self._calc_local_bg_disp(box_cx, box_cy, bbox_w, bbox_h, bg_pts_prev, bg_pts_curr)
+                    if local_dx is not None:
+                        used_local = True
+                        exp_bx = prev_raw_bx + local_dx
+                        exp_by = prev_raw_by + local_dy
+                        inst_dx = raw_bx - exp_bx
+                        inst_dy = raw_by - exp_by
+                        local_rel_speed = np.sqrt(inst_dx**2 + inst_dy**2) / dt
+                        local_rel_speed_norm = local_rel_speed / max(bbox_h, 20)
+                        if local_rel_speed_norm < NORM_STATIC_THRESHOLD:
+                            bg_consistent = True
+                    else:
+                        P_prev = np.array([[prev_raw_bx], [prev_raw_by], [1.0]], dtype=np.float32)
+                        P_exp = M_smooth @ P_prev
+                        exp_bx, exp_by = float(P_exp[0, 0]), float(P_exp[1, 0])
+                        inst_dx = raw_bx - exp_bx
+                        inst_dy = raw_by - exp_by
+
+                # EMA平滑速度，0.7响应更快，不会把慢走速度磨没
+                last_vx = 0.7 * (inst_dx / dt) + 0.3 * last_vx
+                last_vy = 0.7 * (inst_dy / dt) + 0.3 * last_vy
+                
+                # 合速度判断动静，解决径向移动误判静止
+                comp_speed_pixels = np.sqrt(last_vx**2 + last_vy**2)
                 instant_speed_norm = comp_speed_pixels / max(bbox_h, 20)
-                last_vx, last_vy = real_dx / dt, real_dy / dt
+                
                 speed_window.append(instant_speed_norm)
                 avg_speed_norm = np.mean(speed_window) if len(speed_window) > 0 else 0
 
-                # 自适应阈值
-                pixel_noise_floor = RESIDUAL_SIGMA_MULT * bg_residual_px + DETECTION_JITTER_PX
+                # 自适应阈值：固定相机噪声减半
+                if FIXED_CAMERA:
+                    pixel_noise_floor = DETECTION_JITTER_PX * 0.5
+                else:
+                    pixel_noise_floor = RESIDUAL_SIGMA_MULT * bg_residual_px + DETECTION_JITTER_PX
+                    
                 noise_floor_norm = (pixel_noise_floor / dt) / max(bbox_h, 20)
                 adaptive_static_thresh = max(NORM_STATIC_THRESHOLD, noise_floor_norm)
-                adaptive_move_thresh = max(NORM_MOVE_THRESHOLD, noise_floor_norm * 2.0)
-
+                adaptive_move_thresh = max(NORM_MOVE_THRESHOLD, noise_floor_norm * 1.5)
                 move_confirm_needed = MOVE_CONFIRM_FRAMES
                 if is_large:
                     adaptive_move_thresh *= LARGE_MOVE_THRESH_MULT
@@ -149,6 +152,8 @@ class VRUTracker:
                         static_cnt = 0
 
                 # 更新轨迹
+                track['raw_bx'] = raw_bx
+                track['raw_by'] = raw_by
                 track['smooth_bx'] = smooth_bx
                 track['smooth_by'] = smooth_by
                 track['speed_window'] = speed_window
@@ -164,6 +169,8 @@ class VRUTracker:
                 track['static_thresh'] = adaptive_static_thresh
                 track['used_local'] = used_local
                 track['hit_cnt'] += 1
+                if kps is not None:
+                    track['kps_hist'].append(kps)
                 if track['state'] == TRACK_STATE_NEW and track['hit_cnt'] >= TRACK_NEW_CONFIRM_FRAMES:
                     track['state'] = TRACK_STATE_STABLE
 
@@ -176,7 +183,12 @@ class VRUTracker:
                     'state': state,
                     'speed_norm': avg_speed_norm,
                     'static_thresh': adaptive_static_thresh,
-                    'used_local': used_local
+                    'used_local': used_local,
+                    'keypoints': kps,
+                    'lost_cnt': track['lost_cnt'],
+                    'last_vx': last_vx,
+                    'last_vy': last_vy,
+                    'bbox_h': bbox_h
                 })
 
             else:
@@ -191,6 +203,8 @@ class VRUTracker:
                     'hit_cnt': 0,
                     'lost_cnt': 0,
                     'bbox': (x1, y1, x2, y2),
+                    'raw_bx': raw_bx,
+                    'raw_by': raw_by,
                     'bottom_center': (raw_bx, raw_by),
                     'smooth_bx': raw_bx,
                     'smooth_by': raw_by,
@@ -202,11 +216,14 @@ class VRUTracker:
                     'static_cnt': 0,
                     'move_cnt': 0,
                     'last_vx': 0.0,
-                    'last_vy': 0.0
+                    'last_vy': 0.0,
+                    'kps_hist': deque(maxlen=5)
                 }
                 track = self.track_history[track_id]
                 smooth_bx, smooth_by = raw_bx, raw_by
                 track['hit_cnt'] += 1
+                if kps is not None:
+                    track['kps_hist'].append(kps)
 
                 results.append({
                     'track_id': track_id,
@@ -217,7 +234,12 @@ class VRUTracker:
                     'state': 'static',
                     'speed_norm': 0,
                     'static_thresh': NORM_STATIC_THRESHOLD,
-                    'used_local': False
+                    'used_local': False,
+                    'keypoints': kps,
+                    'lost_cnt': 0,
+                    'last_vx': 0.0,
+                    'last_vy': 0.0,
+                    'bbox_h': bbox_h
                 })
                 continue
 
@@ -237,5 +259,4 @@ class VRUTracker:
                         track['smooth_by'] += track['last_vy'] * dt
                         track['state'] = TRACK_STATE_LOST
                     self.track_history[tid] = track
-
         return results
