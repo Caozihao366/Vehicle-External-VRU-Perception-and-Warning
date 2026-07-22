@@ -65,7 +65,7 @@ class EgoMotionEstimator:
                 src_pts = np.float32([self.prev_kp[m.queryIdx].pt for m in good]).reshape(-1, 2)
                 dst_pts = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 2)
                 sim_transform, mask_inliers = cv2.estimateAffinePartial2D(
-                    src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=RANSAC_THRESHOLD
+                    src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=RANSAC_THRESH
                 )
                 if sim_transform is not None:
                     inlier_mask = mask_inliers.ravel() == 1
