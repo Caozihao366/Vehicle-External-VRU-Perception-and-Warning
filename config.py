@@ -81,7 +81,7 @@ FALL_CONFIRM_FRAMES = 1
 # 逆行检测参数
 # ===============================
 # 道路方向
-ROAD_DIRECTION = np.array([0.0,1.0],dtype=np.float32)
+ROAD_DIRECTION = np.array([0.0,-1.0],dtype=np.float32)
 # 低速过滤
 MIN_MOTION_NORM = 0.1
 # 速度阈值
