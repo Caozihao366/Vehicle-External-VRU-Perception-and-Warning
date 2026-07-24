@@ -85,12 +85,11 @@ ROAD_DIRECTION = np.array([0.0,1.0],dtype=np.float32)
 # 低速过滤
 MIN_MOTION_NORM = 0.1
 # 速度阈值
-WRONG_WAY_SPEED_THRESH = 0.03
+WRONG_WAY_SPEED_THRESH = 0.01 
 # 角度阈值
-# cos(107°)≈-0.3
-WRONG_WAY_COS_THRESH = -0.3
+WRONG_WAY_COS_THRESH = 0.0
 # 连续确认
-WRONG_WAY_CONFIRM_FRAMES = 30
+WRONG_WAY_CONFIRM_FRAMES = 3
 # 历史窗口
 MAX_HIST_FRAMES = 5
 # ==================== 显示 ====================
