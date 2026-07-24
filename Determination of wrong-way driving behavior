@@ -1,96 +1,89 @@
 # =================================================
-        # BEV道路方向逆行检测
-        # =================================================
-        # 目标真实运动（已去除相机运动）
-        rel_dx = track.get("real_dx", 0)
-        rel_dy = track.get("real_dy", 0)
+# BEV道路方向逆行检测
+# 已完成相机运动补偿
+# 输入:
+# real_dx
+# real_dy
+# =================================================
 
-        motion_vec = np.array([rel_dx, rel_dy], dtype=np.float32)
-        motion_norm = np.linalg.norm(motion_vec)
+# -------------------------------
+# 目标真实运动
+# -------------------------------
+rel_dx = track.get("real_dx", 0)
+rel_dy = track.get("real_dy", 0)
 
-        # 自适应低速过滤
-        bbox_h = track["bbox"][3] - track["bbox"][1]
-        # 小目标提高过滤阈值
-        size_factor = 20.0 / max(bbox_h, 20)
-        # 背景补偿残差
-        bg_residual = track.get("bg_residual", 1.0)
-        # ORB不稳定时提高过滤
-        noise_factor = 1.0 + bg_residual * 0.2
-        adaptive_min_motion = BASE_MIN_MOTION * size_factor * noise_factor
-        # 静止目标
-        if motion_norm < adaptive_min_motion:
-            hist["bev_speed_hist"].append(0.0)
-            if len(hist["bev_speed_hist"]) > MAX_HIST_FRAMES:
-                hist["bev_speed_hist"].pop(0)
-            hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 2)
+motion_vec = np.array([rel_dx, rel_dy], dtype=np.float32)
+motion_norm = np.linalg.norm(motion_vec)
+
+
+# =================================================
+# 自适应低速过滤
+# 防止检测抖动导致误报
+# =================================================
+bbox_h = track["bbox"][3] - track["bbox"][1]
+
+# 小目标提高过滤
+size_factor = 20.0 / max(bbox_h, 20)
+
+# ORB背景残差，越大说明运动补偿越不稳定
+bg_residual = track.get("bg_residual", 1.0)
+noise_factor = 1.0 + bg_residual * 0.2
+
+adaptive_min_motion = MIN_MOTION_NORM * size_factor * noise_factor
+
+
+# =================================================
+# 静止目标
+# =================================================
+if motion_norm < adaptive_min_motion:
+    hist["bev_speed_hist"].append(0.0)
+    if len(hist["bev_speed_hist"]) > MAX_HIST_FRAMES:
+        hist["bev_speed_hist"].pop(0)
+
+    # 快速解除逆行状态
+    hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 2)
+
+else:
+    # =================================================
+    # 道路方向（车辆正常行驶方向）
+    # =================================================
+    road_dir = ROAD_DIRECTION / (np.linalg.norm(ROAD_DIRECTION) + 1e-6)
+
+    # =================================================
+    # 沿道路方向速度
+    # =================================================
+    road_vel = np.dot(motion_vec, road_dir) / max(dt, 0.001)
+
+    # 尺寸归一化
+    road_vel_norm = road_vel / max(abs(bbox_h), 20)
+
+    # 保存历史
+    hist["bev_speed_hist"].append(road_vel_norm)
+    if len(hist["bev_speed_hist"]) > MAX_HIST_FRAMES:
+        hist["bev_speed_hist"].pop(0)
+
+    # =================================================
+    # 连续判断
+    # =================================================
+    if len(hist["bev_speed_hist"]) >= MAX_HIST_FRAMES:
+        avg_speed = np.mean(hist["bev_speed_hist"])
+
+        # 速度方向判断
+        cond_speed = avg_speed < -WRONG_WAY_SPEED_THRESH
+
+        # 运动方向角度判断
+        motion_unit = motion_vec / (motion_norm + 1e-6)
+        cos_theta = np.dot(motion_unit, road_dir)
+
+        # 夹角判断
+        cond_angle = cos_theta < WRONG_WAY_COS_THRESH
+
+        # 双条件确认
+        if cond_speed and cond_angle:
+            hist["wrong_way_cnt"] += 1
         else:
-            # =================================================
-            # ROAD_DIRECTION 是车辆前进方向
-            # =================================================
-            road_dir = ROAD_DIRECTION / (np.linalg.norm(ROAD_DIRECTION) + 1e-6)
-            # =================================================
-            # 目标沿道路方向速度
-            # =================================================
-            road_vel = np.dot(motion_vec, road_dir) / max(dt, 0.001)
-            # 尺寸归一化
-            road_vel_norm = road_vel / max(abs(bbox_h), 20)
-            # 保存速度历史
-            hist["bev_speed_hist"].append(road_vel_norm)
-            if len(hist["bev_speed_hist"]) > MAX_HIST_FRAMES:
-                hist["bev_speed_hist"].pop(0)
+            hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 1)
 
-            # =================================================
-            # 连续判断
-            # =================================================
-            if len(hist["bev_speed_hist"]) >= MAX_HIST_FRAMES:
-                avg_speed = np.mean(hist["bev_speed_hist"])
-                # 运动方向
-                motion_unit = motion_vec / (motion_norm + 1e-6)
-                # 与道路方向夹角
-                cos_theta = np.dot(motion_unit, road_dir)
-                # 速度反向
-                cond_speed = avg_speed < -WRONG_WAY_SPEED_THRESH
-                # 方向反向
-                cond_angle = cos_theta < -0.3
-                if cond_speed and cond_angle:
-                    hist["wrong_way_cnt"] += 1
-                else:
-                    hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 1)
-
-                # 连续确认
-                if hist["wrong_way_cnt"] >= WRONG_WAY_CONFIRM_FRAMES:
-                    return "wrong_way", 0.9
-        # 自适应低速过滤
-        # ================================
-        bbox_h = track["bbox"][3] - track["bbox"][1]
-        size_factor = 20 / max(bbox_h, 20)
-        bg_residual = track.get("bg_residual", 1.0)
-        noise_factor = 1 + bg_residual * 0.2
-        adaptive_threshold = MIN_MOTION_NORM * size_factor * noise_factor
-        if motion_norm < adaptive_threshold:
-            hist["bev_speed_hist"].append(0)
-            if len(hist["bev_speed_hist"]) > MAX_HIST_FRAMES:
-                hist["bev_speed_hist"].pop(0)
-            hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 2)
-        else:
-            # ================================
-            # 道路方向
-            # ================================
-            road_dir = ROAD_DIRECTION / (np.linalg.norm(ROAD_DIRECTION) + 1e-6)
-            # 沿道路速度
-            road_vel = np.dot(motion_vec, road_dir) / max(dt, 0.001)
-            road_vel_norm = road_vel / max(bbox_h, 20)
-            hist["bev_speed_hist"].append(road_vel_norm)
-            if len(hist["bev_speed_hist"]) > MAX_HIST_FRAMES:
-                hist["bev_speed_hist"].pop(0)
-            if len(hist["bev_speed_hist"]) >= MAX_HIST_FRAMES:
-                avg_speed = np.mean(hist["bev_speed_hist"])
-                # ================================
-                # 逆行判断
-                # ================================
-                if avg_speed < -WRONG_WAY_SPEED_THRESH:
-                    hist["wrong_way_cnt"] += 1
-                else:
-                    hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 1)
-                if hist["wrong_way_cnt"] >= WRONG_WAY_CONFIRM_FRAMES:
-                    return "wrong_way", 0.9
+        # 连续30帧确认
+        if hist["wrong_way_cnt"] >= WRONG_WAY_CONFIRM_FRAMES:
+            return "wrong_way", 0.9
