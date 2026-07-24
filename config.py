@@ -77,8 +77,21 @@ FALL_TORSO_ANGLE = 40
 FALL_HW_RATIO = 1.6
 FALL_VERTICAL_SPEED = 1.0
 FALL_CONFIRM_FRAMES = 1
-# 逆行预留
-WRONG_WAY_ANGLE_THRESH = 150
+# ===============================
+# 逆行检测参数
+# ===============================
+# 道路方向
+ROAD_DIRECTION = np.array([0.0,1.0],dtype=np.float32)
+# 低速过滤
+MIN_MOTION_NORM = 0.1
+# 速度阈值
+WRONG_WAY_SPEED_THRESH = 0.03
+# 角度阈值
+# cos(107°)≈-0.3
+WRONG_WAY_COS_THRESH = -0.3
+# 连续确认
 WRONG_WAY_CONFIRM_FRAMES = 30
+# 历史窗口
+MAX_HIST_FRAMES = 5
 # ==================== 显示 ====================
 WINDOW_NAME = "VRU异常行为检测"
