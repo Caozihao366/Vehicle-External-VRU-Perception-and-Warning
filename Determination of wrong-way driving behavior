@@ -84,6 +84,6 @@ else:
         else:
             hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 1)
 
-        # 连续30帧确认
+        # 连续3帧确认
         if hist["wrong_way_cnt"] >= WRONG_WAY_CONFIRM_FRAMES:
             return "wrong_way", 0.9
