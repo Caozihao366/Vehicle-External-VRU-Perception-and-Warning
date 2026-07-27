@@ -92,5 +92,7 @@ WRONG_WAY_COS_THRESH = 0.0
 WRONG_WAY_CONFIRM_FRAMES = 3
 # 历史窗口
 MAX_HIST_FRAMES = 5
+# 逆行速度差阈值
+WRONG_SPEED_MARGIN = 5.0
 # ==================== 显示 ====================
 WINDOW_NAME = "VRU异常行为检测"
