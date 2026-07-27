@@ -1,29 +1,76 @@
-# =================================================
-# BEV道路方向逆行检测
-# 已完成自车运动补偿
-# =================================================
+        # ==================== 2. 逆行判断 ====================
+        if behavior == 'normal':
+            motion_vec = np.array(
+                [track.get("real_dx", 0), track.get("real_dy", 0)],
+                dtype=np.float32
+            )
+            motion_norm = np.linalg.norm(motion_vec)
+            bbox = track["bbox"]
+            bbox_h = max(bbox[3] - bbox[1], 20)
 
-real_dx = track.get("real_dx", 0)
-real_dy = track.get("real_dy", 0)
+            if motion_norm > MIN_MOTION_NORM:
+                road_dir = ROAD_DIRECTION / (np.linalg.norm(ROAD_DIRECTION) + 1e-6)
 
-motion_vec = np.array([real_dx, real_dy], dtype=np.float32)
-motion_norm = np.linalg.norm(motion_vec)
+                # ==========================
+                # 运动方向夹角
+                # ==========================
+                cos_theta = np.dot(motion_vec / motion_norm, road_dir)
+                cond_angle = cos_theta < WRONG_WAY_COS_THRESH
 
-road_dir = ROAD_DIRECTION / (np.linalg.norm(ROAD_DIRECTION) + 1e-6)
+                # ==========================
+                # 目标速度
+                # ==========================
+                road_speed = np.dot(motion_vec, road_dir) / max(dt, 0.001)
+                target_vel = road_speed
+                speed_norm = road_speed / bbox_h
+                hist["bev_speed_hist"].append(speed_norm)
 
-if motion_norm > MIN_MOTION_NORM:
-    road_speed = np.dot(motion_vec, road_dir)
+                if len(hist["bev_speed_hist"]) >= MAX_HIST_FRAMES:
+                    avg_speed = np.mean(hist["bev_speed_hist"])
 
-    motion_unit = motion_vec / (motion_norm + 1e-6)
-    cos_theta = np.dot(motion_unit, road_dir)
+                    # ==========================
+                    # 原来的反向速度判断
+                    # ==========================
+                    cond_speed = avg_speed < 0
 
-    cond_speed = road_speed < -WRONG_WAY_SPEED_THRESH
-    cond_angle = cos_theta < WRONG_WAY_COS_THRESH
+                    # ==========================
+                    # 背景速度
+                    # ==========================
+                    bg_vec = np.array(
+                        [track.get("local_bg_dx", 0), track.get("local_bg_dy", 0)],
+                        dtype=np.float32
+                    )
+                    bg_vel = np.dot(bg_vec, road_dir) / max(dt, 0.001)
 
-    if cond_speed and cond_angle:
-        hist["wrong_way_cnt"] += 1
-    else:
-        hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 1)
+                    # ==========================
+                    # 原来的背景过滤
+                    # ==========================
+                    bg_cond = True
+                    if target_vel < 0 and bg_vel < 0:
+                        if abs(target_vel) <= abs(bg_vel) * 1.2:
+                            bg_cond = False
 
-    if hist["wrong_way_cnt"] >= WRONG_WAY_CONFIRM_FRAMES:
-        return "wrong_way", 0.9
+                    # ==========================
+                    # 新增加：目标速度必须超过背景速度
+                    # ==========================
+                    speed_diff = abs(target_vel) - abs(bg_vel)
+                    cond_velocity = speed_diff > WRONG_SPEED_MARGIN
+
+                    # ==========================
+                    # 四个条件同时满足
+                    # 1. 方向反
+                    # 2. 速度反向
+                    # 3. 排除背景运动
+                    # 4. 目标速度超过背景速度
+                    # ==========================
+                    if cond_speed and cond_angle and bg_cond and cond_velocity:
+                        hist["wrong_way_cnt"] += 1
+                    else:
+                        hist["wrong_way_cnt"] = max(0, hist["wrong_way_cnt"] - 1)
+
+                    # ==========================
+                    # 连续帧确认
+                    # ==========================
+                    if hist["wrong_way_cnt"] >= WRONG_WAY_CONFIRM_FRAMES:
+                        behavior = "wrong_way"
+                        confidence = 0.8
