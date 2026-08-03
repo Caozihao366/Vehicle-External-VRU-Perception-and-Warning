@@ -1,0 +1,14 @@
+name: qcnet-ego-inference
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.0.1
+  - pytorch-cuda=11.8
+  - pip
+  - pip:
+      - torch-geometric==2.3.0
+# Install torch-scatter, torch-sparse, and torch-cluster from the matching
+# https://data.pyg.org wheel index after creating this environment.
