@@ -1,10 +1,11 @@
-"""Stable high-level single-scenario deployment interface."""
+"""Stable high-level single-scenario and streaming BEV deployment interface."""
 
-from typing import Mapping
+from typing import Mapping, Optional
 
 import torch
 
 from .input_adapter import EgoInputAdapter
+from .bev_interface import BEVFrame, HistoryBuffer
 from .model_loader import load_inference_model
 from .output_types import PredictionResult
 
@@ -21,7 +22,21 @@ class EgoTrajectoryPredictor:
         self.device = torch.device(device)
         self.return_cpu = bool(return_cpu)
         self.input_adapter = EgoInputAdapter()
+        self.history_buffer = HistoryBuffer()
         self.model, self.load_audit = load_inference_model(checkpoint_path, device)
+
+    def update(self, bev_frame: BEVFrame) -> Optional[PredictionResult]:
+        """Append one 10 Hz BEV frame and predict once 50 frames are available."""
+        if self.model is None:
+            raise RuntimeError('Predictor is closed.')
+        self.history_buffer.update(bev_frame)
+        if not self.history_buffer.ready:
+            return None
+        return self.predict(self.history_buffer.to_qcnet_input())
+
+    def reset_history(self) -> None:
+        """Clear streaming history before starting a different sequence."""
+        self.history_buffer.clear()
 
     def predict(self, input_data: Mapping[str, object]) -> PredictionResult:
         if self.model is None:
@@ -85,6 +100,7 @@ class EgoTrajectoryPredictor:
         )
 
     def close(self) -> None:
+        self.history_buffer.clear()
         self.model = None
         if self.device.type == 'cuda' and torch.cuda.is_available():
             torch.cuda.empty_cache()
