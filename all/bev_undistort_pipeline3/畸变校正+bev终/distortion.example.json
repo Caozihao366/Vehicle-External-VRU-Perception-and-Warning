@@ -1,0 +1,8 @@
+{
+  "CAM_FRONT": {"model": "fisheye", "intrinsic": [[1000, 0, 800], [0, 1000, 450], [0, 0, 1]], "distortion": [-0.10, 0.01, 0.0, 0.0], "balance": 0.0},
+  "CAM_FRONT_RIGHT": {"model": "fisheye", "intrinsic": [[1000, 0, 800], [0, 1000, 450], [0, 0, 1]], "distortion": [-0.10, 0.01, 0.0, 0.0], "balance": 0.0},
+  "CAM_BACK_RIGHT": {"model": "fisheye", "intrinsic": [[1000, 0, 800], [0, 1000, 450], [0, 0, 1]], "distortion": [-0.10, 0.01, 0.0, 0.0], "balance": 0.0},
+  "CAM_BACK": {"model": "fisheye", "intrinsic": [[1000, 0, 800], [0, 1000, 450], [0, 0, 1]], "distortion": [-0.10, 0.01, 0.0, 0.0], "balance": 0.0},
+  "CAM_BACK_LEFT": {"model": "fisheye", "intrinsic": [[1000, 0, 800], [0, 1000, 450], [0, 0, 1]], "distortion": [-0.10, 0.01, 0.0, 0.0], "balance": 0.0},
+  "CAM_FRONT_LEFT": {"model": "fisheye", "intrinsic": [[1000, 0, 800], [0, 1000, 450], [0, 0, 1]], "distortion": [-0.10, 0.01, 0.0, 0.0], "balance": 0.0}
+}

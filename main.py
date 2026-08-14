@@ -1,100 +1,116 @@
-import cv2
-import time
-from ultralytics import YOLO
-from config import *
-from ego_motion import EgoMotionEstimator
-from vru_tracker import VRUTracker
-from behavior_analyzer import BehaviorAnalyzer
-from visualization import draw_results
+"""
+车外环视感知VRU轨迹预测与异常行为预警系统
+=========================================
+入口文件。单路前视视频模式。
 
-FIXED_CAMERA = False
+用法:
+    python main.py                          # 使用默认视频
+    python main.py --video test.mp4         # 指定视频
+    python main.py --camera 0               # 使用摄像头
+    python main.py --ego-speed 15           # 自车速度 15 m/s
+    python main.py --no-lane                # 禁用车道线检测（加速）
+    python main.py --cpu                    # 使用 CPU
+"""
+import argparse
+import sys
+import time
+
+import cv2
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="车外环视VRU感知系统")
+    parser.add_argument("--video", type=str, default=None,
+                        help="视频文件路径（默认使用 input/test.mp4）")
+    parser.add_argument("--camera", type=int, default=None,
+                        help="摄像头 ID（如 0）")
+    parser.add_argument("--ego-speed", type=float, default=0.0,
+                        help="自车速度 (m/s)，默认 0（静止）")
+    parser.add_argument("--ego-yaw-rate", type=float, default=0.0,
+                        help="自车横摆角速度 (rad/s)")
+    parser.add_argument("--no-lane", action="store_true",
+                        help="禁用 YOLOPv2 车道线检测")
+    parser.add_argument("--no-wrong-way", action="store_true",
+                        help="禁用逆行检测")
+    parser.add_argument("--no-sensor-quality", action="store_true",
+                        help="禁用传感器质量检测")
+    parser.add_argument("--cpu", action="store_true",
+                        help="使用 CPU 推理")
+    parser.add_argument("--output", type=str, default=None,
+                        help="报文输出路径（JSONL 格式，如 output/messages.jsonl）")
+    parser.add_argument("--no-ui", action="store_true",
+                        help="不显示 UI 窗口（仅处理和输出报文）")
+    return parser.parse_args()
+
 
 def main():
-    # 初始化所有模块
-    model = YOLO(YOLO_MODEL_PATH)
-    cap = cv2.VideoCapture(0)
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    
-    ego_estimator = EgoMotionEstimator()
-    tracker = VRUTracker()
-    behavior_analyzer = BehaviorAnalyzer()
-    prev_time = time.time()
+    args = parse_args()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        current_time = time.time()
-        dt = max(current_time - prev_time, 0.001)
-        prev_time = current_time
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # 1. YOLO检测跟踪（pose模型输出和原来完全兼容，多了keypoints）
-        results = model.track(
-            frame, device=0, classes=[0], conf=CONF_THRESHOLD,
-            tracker="bytetrack.yaml", verbose=False, persist=True, half=True
-        )
-
-        # 2. 生成背景掩码 + 取检测框+关键点
-        bg_mask = np.ones(gray.shape, dtype=np.uint8) * 255
-        boxes_data = []
-        keypoints_data = {}
-        count = {"pedestrian": 0}
-
-        if results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            ids = results[0].boxes.id.cpu().numpy().astype(int)
-            clses = results[0].boxes.cls.cpu().numpy().astype(int)
-            # 取关键点：拼接xy和置信度，变成[N,17,3] (x,y,conf)
-            if results[0].keypoints is not None:
-                kp_xy = results[0].keypoints.xy.cpu().numpy()
-                kp_conf = results[0].keypoints.conf.cpu().numpy()
-                # 把置信度拼到最后一维
-                keypoints = np.concatenate([kp_xy, kp_conf[..., None]], axis=-1)
+    # 视频源
+    if args.camera is not None:
+        video_source = args.camera
+    elif args.video is not None:
+        video_source = args.video
+    else:
+        from system_config import DEFAULT_VIDEO, ROOT_DIR
+        from pathlib import Path
+        if Path(DEFAULT_VIDEO).is_file():
+            video_source = DEFAULT_VIDEO
+        else:
+            # 回退到 A2D2 前视图片序列
+            cam_front = ROOT_DIR / "input" / "CAM_FRONT"
+            if cam_front.is_dir():
+                video_source = str(cam_front)
+                print(f"使用图片序列: {cam_front}")
             else:
-                keypoints = None
+                video_source = 0  # 回退到摄像头
 
-            for i, (box, track_id, cls) in enumerate(zip(boxes, ids, clses)):
-                x1, y1, x2, y2 = map(int, box)
-                boxes_data.append((x1, y1, x2, y2, track_id, cls))
-                count["pedestrian"] += 1
-                # 存关键点
-                if keypoints is not None and i < len(keypoints):
-                    keypoints_data[track_id] = keypoints[i]
-                # 掩码外扩15像素，剔除目标边缘特征
-                mx1, my1 = max(0, x1-15), max(0, y1-15)
-                mx2, my2 = min(w, x2+15), min(h, y2+15)
-                bg_mask[my1:my2, mx1:mx2] = 0
+    det_device = "cpu" if args.cpu else 0
 
-        # 3. 自运动估计
-        M_smooth, camera_moving, dx, dy, angle_rad = ego_estimator.update(gray, bg_mask, dt)
-        angle_deg = angle_rad * 180 / np.pi
+    from pipeline import Pipeline
+    from ui import UnifiedUI
+    from message_builder import MessageLogger
 
-        # 4. VRU目标跟踪与运动补偿（传入关键点）
-        vru_results = tracker.update(
-            boxes_data, keypoints_data, dt, M_smooth,
-            ego_estimator.bg_pts_prev, ego_estimator.bg_pts_curr,
-            ego_estimator.bg_residual_px
-        )
+    print("=" * 60)
+    print("  车外环视感知VRU轨迹预测与异常行为预警系统")
+    print("  单路前视模式 (BEV 退化为 2D)")
+    print("=" * 60)
 
-        # 5. 行为分析
-        for obj in vru_results:
-            behavior, conf = behavior_analyzer.analyze(obj, dt, h, w)
-            obj['behavior'] = behavior
-            obj['behavior_conf'] = conf
+    pipeline = Pipeline(
+        video_source=video_source,
+        ego_speed_mps=args.ego_speed,
+        ego_yaw_rate_rps=args.ego_yaw_rate,
+        enable_sensor_quality=not args.no_sensor_quality,
+        enable_wrong_way=not args.no_wrong_way,
+        enable_yolopv2=not args.no_lane,
+        det_device=det_device,
+    )
 
-        # 6. 绘制结果
-        annotated = draw_results(frame, vru_results, ego_estimator.motion_state,
-                                camera_moving, dx, dy, angle_deg, ego_estimator.bg_residual_px, count)
-        cv2.imshow(WINDOW_NAME, annotated)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-            break
+    ui = None if args.no_ui else UnifiedUI()
+    msg_logger = MessageLogger(output_path=args.output) if args.output else None
 
-    cap.release()
-    cv2.destroyAllWindows()
+    print("\n开始处理，按 Q 退出...\n")
+    try:
+        for result in pipeline:
+            if ui is not None:
+                ui.show(result)
+            if msg_logger is not None:
+                msg_logger.log(result)
+
+            if ui is not None:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:  # Q or ESC
+                    print("用户退出。")
+                    break
+    except KeyboardInterrupt:
+        print("\n中断。")
+    finally:
+        pipeline.release()
+        if msg_logger is not None:
+            msg_logger.close()
+        cv2.destroyAllWindows()
+        print("已退出。")
+
 
 if __name__ == "__main__":
     main()
