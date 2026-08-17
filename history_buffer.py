@@ -57,27 +57,52 @@ class HistoryBuffer:
         }
         return mapping.get(type_str, 9)  # 9=unknown
 
-    def build_qcnet_input(self) -> Optional[dict]:
-        """
-        构建 QCNet 输入 dict。
-
-        Returns:
-            dict with position/velocity/heading/valid_mask/agent_type/av_index
-            或 None（历史不足时）
-        """
-        if not self.ready():
+    def build_qcnet_input(
+        self,
+        *,
+        ego_speed_mps: float = 0.0,
+        ego_yaw_rate_rps: float = 0.0,
+        output_frequency_hz: float = 10.0,
+    ) -> Optional[dict]:
+        """构建最新时刻固定 ego 坐标系下的 QCNet 历史输入。"""
+        if len(self._frames) < 2 or output_frequency_hz <= 0:
             return None
 
-        # 收集所有出现过的 track_id（最近一帧的目标 + 自车）
         latest = self._frames[-1]
-        all_ids = ["ego"]  # 自车始终在 index 0
+        latest_t = float(latest.timestamp)
+        all_ids = ["ego"]
+        latest_type = {}
         for obj in latest.objects:
             sid = str(obj.id)
             if sid not in all_ids:
                 all_ids.append(sid)
+                latest_type[sid] = obj.type
 
         n = len(all_ids)
         h = self.history_steps
+        if n < 2:
+            return None
+
+        grid = latest_t - np.arange(h - 1, -1, -1, dtype=np.float64) / output_frequency_hz
+        raw = {sid: [] for sid in all_ids}
+
+        for frame in self._frames:
+            frame_t = float(frame.timestamp)
+            age_s = max(0.0, latest_t - frame_t)
+            ego_x, ego_y, ego_yaw = self._past_ego_pose(
+                age_s, ego_speed_mps, ego_yaw_rate_rps
+            )
+            raw["ego"].append((frame_t, ego_x, ego_y))
+
+            c, s = np.cos(ego_yaw), np.sin(ego_yaw)
+            for obj in frame.objects:
+                sid = str(obj.id)
+                if sid not in raw:
+                    continue
+                local_x, local_y = float(obj.position[0]), float(obj.position[1])
+                fixed_x = ego_x + c * local_x - s * local_y
+                fixed_y = ego_y + s * local_x + c * local_y
+                raw[sid].append((frame_t, fixed_x, fixed_y))
 
         position = np.zeros((n, h, 2), dtype=np.float32)
         velocity = np.zeros((n, h, 2), dtype=np.float32)
@@ -85,65 +110,97 @@ class HistoryBuffer:
         valid_mask = np.zeros((n, h), dtype=bool)
         agent_type = np.zeros((n,), dtype=np.int64)
 
-        # 自车类型
-        agent_type[0] = 0  # vehicle
+        agent_type[0] = 0
 
-        # 填充历史
-        # _frames 中最老的帧对应 step 0，最新帧对应 step h-1
-        # 如果帧数不足 h，前面补 invalid
-        n_frames = len(self._frames)
-        start_step = h - n_frames
+        for idx, sid in enumerate(all_ids):
+            samples = sorted(raw[sid], key=lambda item: item[0])
+            if len(samples) < 2:
+                continue
+            times = np.asarray([sample[0] for sample in samples], dtype=np.float64)
+            xs = np.asarray([sample[1] for sample in samples], dtype=np.float64)
+            ys = np.asarray([sample[2] for sample in samples], dtype=np.float64)
+            gaps = np.diff(times)
+            gaps = gaps[gaps > 1e-6]
+            typical_gap = float(np.median(gaps)) if gaps.size else 0.1
+            max_gap = max(0.25, typical_gap * 2.5)
 
-        for step_offset, frame in enumerate(self._frames):
-            step = start_step + step_offset
-
-            # 自车：ego 坐标系下始终 [0,0]，速度为 ego 速度
-            position[0, step] = [0.0, 0.0]
-            velocity[0, step] = frame.ego.velocity
-            heading[0, step] = 0.0
-            valid_mask[0, step] = True
-
-            # 各目标
-            for obj in frame.objects:
-                sid = str(obj.id)
-                if sid in all_ids:
-                    idx = all_ids.index(sid)
-                    position[idx, step] = obj.position
-                    velocity[idx, step] = obj.velocity
-                    heading[idx, step] = obj.heading
+            for step, target_t in enumerate(grid):
+                if target_t < times[0] - 1e-6 or target_t > times[-1] + 1e-6:
+                    continue
+                right = int(np.searchsorted(times, target_t, side="left"))
+                if right < len(times) and abs(times[right] - target_t) <= 1e-6:
+                    position[idx, step] = (xs[right], ys[right])
                     valid_mask[idx, step] = True
-                    agent_type[idx] = self._agent_types.get(
-                        obj.id, self._type_to_int(obj.type)
-                    )
+                    continue
+                if right == 0 or right >= len(times):
+                    continue
+                left = right - 1
+                gap = times[right] - times[left]
+                if gap <= 0 or gap > max_gap:
+                    continue
+                alpha = (target_t - times[left]) / gap
+                position[idx, step, 0] = xs[left] + alpha * (xs[right] - xs[left])
+                position[idx, step, 1] = ys[left] + alpha * (ys[right] - ys[left])
+                valid_mask[idx, step] = True
 
-        # 过滤有效历史不足 2 帧的目标（QCNet 要求至少 2 个有效样本）
-        keep = [0]  # 始终保留 ego
+            self._differentiate_valid_segments(
+                position[idx], valid_mask[idx], velocity[idx], output_frequency_hz
+            )
+            moving = np.linalg.norm(velocity[idx], axis=1) > 0.05
+            heading[idx, moving] = np.arctan2(
+                velocity[idx, moving, 1], velocity[idx, moving, 0]
+            )
+            if idx > 0:
+                agent_type[idx] = self._type_to_int(latest_type.get(sid, "unknown"))
+
+        keep = [0]
         for idx in range(1, n):
-            if valid_mask[idx].sum() >= 2:
+            if valid_mask[idx].sum() >= 2 and valid_mask[idx, -1]:
                 keep.append(idx)
-        keep = np.array(keep, dtype=np.int64)
+        if len(keep) < 2 or valid_mask[0].sum() < 2:
+            return None
 
-        if len(keep) < 2:
-            return None  # 除 ego 外没有足够历史的目标
-
-        position = position[keep]
-        velocity = velocity[keep]
-        heading = heading[keep]
-        valid_mask = valid_mask[keep]
-        agent_type = agent_type[keep]
-        all_ids = [all_ids[i] for i in keep]
+        keep_array = np.asarray(keep, dtype=np.int64)
 
         return {
-            "position": position,
-            "velocity": velocity,
-            "heading": heading,
-            "valid_mask": valid_mask,
-            "agent_type": agent_type,
+            "position": position[keep_array],
+            "velocity": velocity[keep_array],
+            "heading": heading[keep_array],
+            "valid_mask": valid_mask[keep_array],
+            "agent_type": agent_type[keep_array],
             "av_index": 0,
             "coordinate_frame": "ego",
-            "frequency_hz": 10.0,
-            "agent_ids": all_ids,
+            "frequency_hz": float(output_frequency_hz),
+            "agent_ids": [all_ids[index] for index in keep],
         }
+
+    @staticmethod
+    def _past_ego_pose(age_s: float, speed_mps: float, yaw_rate_rps: float):
+        """过去自车位姿在最新 t0 ego 坐标系中的表达。"""
+        t = -float(age_s)
+        speed = float(speed_mps)
+        yaw_rate = float(yaw_rate_rps)
+        yaw = yaw_rate * t
+        if abs(yaw_rate) < 1e-8:
+            return speed * t, 0.0, 0.0
+        radius = speed / yaw_rate
+        return (
+            float(radius * np.sin(yaw)),
+            float(radius * (1.0 - np.cos(yaw))),
+            float(yaw),
+        )
+
+    @staticmethod
+    def _differentiate_valid_segments(position, valid, output, frequency_hz):
+        """只在连续有效区间内对位置求差分速度。"""
+        indices = np.flatnonzero(valid)
+        if indices.size < 2:
+            return
+        segments = np.split(indices, np.where(np.diff(indices) != 1)[0] + 1)
+        dt = 1.0 / float(frequency_hz)
+        for segment in segments:
+            if segment.size >= 2:
+                output[segment] = np.gradient(position[segment], dt, axis=0)
 
     def get_latest_positions(self) -> Dict:
         """返回最新一帧各目标的位置 {id: (x, y)}。"""

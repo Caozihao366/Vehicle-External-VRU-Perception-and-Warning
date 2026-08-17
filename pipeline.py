@@ -6,6 +6,7 @@
 
 单路前视视频模式（BEV 退化为 2D 地面平面投影）。
 """
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,6 +119,8 @@ class Pipeline:
             print(f"[pipeline] 视频: {self.width}x{self.height} @ {self.fps_video:.1f}fps")
 
         self.frame_id = 0
+        self._prev_source_timestamp = None
+        self._live_camera = isinstance(self.video_source, int)
 
         # ---- 初始化各模块 ----
         print("[pipeline] 初始化 VRU 感知模块...")
@@ -174,7 +177,8 @@ class Pipeline:
         if self._image_list is not None:
             if self._image_idx >= len(self._image_list):
                 raise StopIteration
-            frame = cv2.imread(self._image_list[self._image_idx])
+            image_path = self._image_list[self._image_idx]
+            frame = cv2.imread(image_path)
             self._image_idx += 1
             if frame is None:
                 raise StopIteration
@@ -188,14 +192,35 @@ class Pipeline:
         self.frame_id += 1
 
         now = time.time()
-        dt = max(now - self._prev_time, 0.001) if self._prev_time else 1.0 / self.fps_video
+        processing_dt = max(now - self._prev_time, 0.001) if self._prev_time else 1.0 / self.fps_video
         self._prev_time = now
         timestamp = now
+
+        # 仅 BEV/TTC/QCNet 使用数据源时间。检测、跟踪和行为模块继续使用
+        # 原有的处理时钟，避免本次 TTC 修复改变其他模块的运行语义。
+        if self._image_list is not None:
+            source_timestamp = self._image_timestamp(image_path)
+            if source_timestamp is None:
+                source_timestamp = (self.frame_id - 1) / self.fps_video
+        elif self._live_camera:
+            source_timestamp = now
+        else:
+            source_timestamp = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if source_timestamp <= 0.0:
+                source_timestamp = (self.frame_id - 1) / self.fps_video
+
+        if self._prev_source_timestamp is None:
+            source_dt = 1.0 / self.fps_video
+        else:
+            source_dt = source_timestamp - self._prev_source_timestamp
+            if source_dt <= 0.0:
+                source_dt = 1.0 / self.fps_video
+        self._prev_source_timestamp = source_timestamp
 
         result = FrameResult(
             frame_id=self.frame_id,
             timestamp=timestamp,
-            fps=1.0 / dt if dt > 0 else 0.0,
+            fps=1.0 / processing_dt if processing_dt > 0 else 0.0,
             frame=frame,
             ego_speed_kmh=self.ego_speed * 3.6,
             ego_speed_mps=self.ego_speed,
@@ -216,7 +241,7 @@ class Pipeline:
                 result.sensor_status = "unknown"
 
         # ---- 2. VRU 检测 + 跟踪 + 姿态 + 行为 ----
-        perc_out = self.perception.process_frame(frame, dt)
+        perc_out = self.perception.process_frame(frame, processing_dt)
         result.tracks = perc_out["tracks"]
         result.ego_motion = perc_out["ego_motion"]
         result.count = perc_out["count"]
@@ -230,11 +255,11 @@ class Pipeline:
 
         # ---- 4. 地面投影 → BEVFrame ----
         bev_frame, projected = self.projector.project_tracks(
-            result.tracks, dt,
+            result.tracks, source_dt,
             ego_speed_mps=self.ego_speed,
             ego_yaw_rate_rps=self.ego_yaw_rate,
             frame_id=self.frame_id,
-            timestamp=timestamp,
+            timestamp=source_timestamp,
         )
         result.bev_frame = bev_frame
         result.projected = projected
@@ -250,9 +275,17 @@ class Pipeline:
             self._init_qcnet()
         if self._qcnet is not None and result.qcnet_ready:
             try:
-                qcnet_input = self.history.build_qcnet_input()
+                qcnet_input = self.history.build_qcnet_input(
+                    ego_speed_mps=self.ego_speed,
+                    ego_yaw_rate_rps=self.ego_yaw_rate,
+                    output_frequency_hz=QCNET_FREQUENCY_HZ,
+                )
                 if qcnet_input is not None:
-                    target_ids = [str(p.track_id) for p in projected]
+                    eligible_ids = set(qcnet_input["agent_ids"])
+                    target_ids = [
+                        str(p.track_id) for p in projected
+                        if str(p.track_id) in eligible_ids
+                    ]
                     if target_ids:
                         qcnet_predictions = self._qcnet.predict(
                             qcnet_input, target_ids=target_ids
@@ -290,3 +323,11 @@ class Pipeline:
     def release(self):
         if self._image_list is None:
             self.cap.release()
+
+    @staticmethod
+    def _image_timestamp(path: str):
+        """读取数据集图片文件名末尾的微秒时间戳。"""
+        match = re.search(
+            r"(\d{13,})\.(?:jpg|jpeg|png|bmp)$", str(path), re.IGNORECASE
+        )
+        return int(match.group(1)) / 1_000_000.0 if match else None

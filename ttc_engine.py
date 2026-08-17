@@ -172,6 +172,14 @@ class TTCEngine:
 
             # ---- 匀速模型 TTC（回退） ----
             if qcnet_pred is None:
+                # GroundPlaneProjector 由相邻 ego 局部坐标差分得到的速度，
+                # 已经是目标相对自车的速度。这里必须把自车视为静止；
+                # 否则 ego_speed 会被重复计算一次，导致 TTC 系统性偏小。
+                relative_ego = TTCEgoState(
+                    x=0.0, y=0.0, yaw=0.0,
+                    speed_mps=0.0,
+                    yaw_rate_rps=0.0,
+                )
                 vru = VRUState(
                     x=obj.position[0],
                     y=obj.position[1],
@@ -180,7 +188,7 @@ class TTCEngine:
                     radius_m=self.vru_radius_m,
                 )
                 ttc_result = compute_ttc(
-                    ego, vru,
+                    relative_ego, vru,
                     horizon_s=self.horizon_s,
                     dt_s=self.dt_s,
                     ego_length_m=self.ego_length_m,
