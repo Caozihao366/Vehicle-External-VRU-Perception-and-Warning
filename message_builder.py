@@ -106,8 +106,33 @@ def build_message(result) -> Dict[str, Any]:
                 "prediction_source": rr.prediction_source,
             }
 
-        # 预测轨迹（QCNet 多模态，暂不输出逐模态，输出最可能模态）
-        prediction = {"traj_points": [], "horizon_s": 0.0, "num_modes": 0}
+        # 对外报文输出QCNet最高概率模态；全部模态仍保留给内部TTC使用。
+        prediction = {
+            "source": None,
+            "traj_points": [],
+            "horizon_s": 0.0,
+            "num_modes": 0,
+            "selected_mode": None,
+            "selected_probability": None,
+        }
+        qcnet_pred = (getattr(result, "qcnet_predictions", {}) or {}).get(str(tid))
+        if qcnet_pred is not None and qcnet_pred.modes:
+            best_mode = max(qcnet_pred.modes, key=lambda mode: mode.probability)
+            prediction = {
+                "source": qcnet_pred.prediction_source,
+                "traj_points": [
+                    {
+                        "t_s": round(float(point.t_s), 3),
+                        "x": round(float(point.x), 3),
+                        "y": round(float(point.y), 3),
+                    }
+                    for point in best_mode.points
+                ],
+                "horizon_s": round(float(qcnet_pred.prediction_horizon_s), 3),
+                "num_modes": len(qcnet_pred.modes),
+                "selected_mode": best_mode.mode_id,
+                "selected_probability": round(float(best_mode.probability), 4),
+            }
 
         vru_objects.append({
             "object_id": str(tid),
@@ -128,6 +153,11 @@ def build_message(result) -> Dict[str, Any]:
         "total_delay_ms": round(result.process_ms, 1),
         "fps": round(result.fps, 1) if result.fps else 0.0,
         "qcnet_ready": result.qcnet_ready,
+        "qcnet_loaded": bool(getattr(result, "qcnet_loaded", False)),
+        "qcnet_active": bool(getattr(result, "qcnet_active", False)),
+        "qcnet_predicted_targets": len(
+            getattr(result, "qcnet_predictions", {}) or {}
+        ),
         "qcnet_history_frames": result.qcnet_history_frames,
     }
 
