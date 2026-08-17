@@ -61,6 +61,12 @@ class UnifiedUI:
         self.window_name = UI_WINDOW_NAME
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
 
+        # 轨迹模式使用独立BEV窗口，避免2400px主画布在常见屏幕上裁掉最右侧。
+        self.trajectory_window_name = "QCNet Trajectory BEV"
+        if self.show_trajectories:
+            cv2.namedWindow(self.trajectory_window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.trajectory_window_name, 600, 700)
+
     def render(self, result) -> np.ndarray:
         """渲染一帧，返回合成图像。"""
         frame = result.frame.copy()
@@ -105,6 +111,9 @@ class UnifiedUI:
         """渲染并显示。"""
         canvas = self.render(result)
         cv2.imshow(self.window_name, canvas)
+        if self.show_trajectories:
+            trajectory_bev = self._draw_bev(result)
+            cv2.imshow(self.trajectory_window_name, trajectory_bev)
         return canvas
 
     def _draw_detections(self, frame, result):
