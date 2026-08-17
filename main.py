@@ -40,6 +40,8 @@ def parse_args():
                         help="报文输出路径（JSONL 格式，如 output/messages.jsonl）")
     parser.add_argument("--no-ui", action="store_true",
                         help="不显示 UI 窗口（仅处理和输出报文）")
+    parser.add_argument("--show-trajectories", action="store_true",
+                        help="在BEV中显示自车CTRV和QCNet多模态预测轨迹")
     return parser.parse_args()
 
 
@@ -86,7 +88,9 @@ def main():
         det_device=det_device,
     )
 
-    ui = None if args.no_ui else UnifiedUI()
+    ui = None if args.no_ui else UnifiedUI(
+        show_trajectories=args.show_trajectories
+    )
     msg_logger = MessageLogger(output_path=args.output) if args.output else None
 
     print("\n开始处理，按 Q 退出...\n")

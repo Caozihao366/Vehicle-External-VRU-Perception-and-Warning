@@ -14,6 +14,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from system_config import *
+from ttc.core import build_ego_trajectory
+from ttc.models import EgoState as TTCEgoState
 
 # COCO 17 关键点骨架连接
 _SKELETON = [
@@ -44,7 +46,8 @@ _BEHAVIOR_CN = {
 class UnifiedUI:
     """统一 UI 渲染器。"""
 
-    def __init__(self):
+    def __init__(self, show_trajectories: bool = False):
+        self.show_trajectories = bool(show_trajectories)
         self.font_small = ImageFont.truetype(FONT_PATH, UI_FONT_SIZE_SMALL)
         self.font_normal = ImageFont.truetype(FONT_PATH, UI_FONT_SIZE_NORMAL)
         self.font_large = ImageFont.truetype(FONT_PATH, UI_FONT_SIZE_LARGE)
@@ -57,6 +60,12 @@ class UnifiedUI:
 
         self.window_name = UI_WINDOW_NAME
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+
+        # 轨迹模式使用独立BEV窗口，避免2400px主画布在常见屏幕上裁掉最右侧。
+        self.trajectory_window_name = "QCNet Trajectory BEV"
+        if self.show_trajectories:
+            cv2.namedWindow(self.trajectory_window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.trajectory_window_name, 600, 700)
 
     def render(self, result) -> np.ndarray:
         """渲染一帧，返回合成图像。"""
@@ -102,6 +111,9 @@ class UnifiedUI:
         """渲染并显示。"""
         canvas = self.render(result)
         cv2.imshow(self.window_name, canvas)
+        if self.show_trajectories:
+            trajectory_bev = self._draw_bev(result)
+            cv2.imshow(self.trajectory_window_name, trajectory_bev)
         return canvas
 
     def _draw_detections(self, frame, result):
@@ -213,6 +225,9 @@ class UnifiedUI:
         ], dtype=np.int32)
         cv2.fillPoly(img, [ego_pts], (0, 200, 0))
 
+        if self.show_trajectories:
+            self._draw_future_trajectories(img, result, world_to_pixel)
+
         # 目标
         for rr in result.risk_results:
             x, y = rr.position
@@ -224,6 +239,76 @@ class UnifiedUI:
                 cv2.circle(img, (px, py), radius + 2, color, 1)
 
         return img
+
+    def _draw_future_trajectories(self, img, result, world_to_pixel):
+        """绘制现有TTC函数生成的自车CTRV和QCNet多模态目标轨迹。"""
+        ego_state = TTCEgoState(
+            x=0.0,
+            y=0.0,
+            yaw=0.0,
+            speed_mps=float(result.ego_speed_mps),
+            yaw_rate_rps=float(result.ego_yaw_rate),
+        )
+        ego_traj = build_ego_trajectory(
+            ego_state,
+            horizon_s=TTC_HORIZON_S,
+            dt_s=TTC_DT_S,
+        )
+        ego_pixels = [world_to_pixel(point.x, point.y) for point in ego_traj]
+        if len(ego_pixels) >= 2:
+            cv2.polylines(
+                img,
+                [np.asarray(ego_pixels, dtype=np.int32)],
+                False,
+                (255, 160, 40),
+                2,
+                cv2.LINE_AA,
+            )
+
+        predictions = getattr(result, "qcnet_predictions", {}) or {}
+        palette = [
+            (255, 0, 255),
+            (0, 220, 255),
+            (255, 120, 0),
+            (180, 80, 255),
+            (0, 180, 120),
+            (120, 220, 255),
+        ]
+        for target_index, (track_id, prediction) in enumerate(predictions.items()):
+            modes = list(getattr(prediction, "modes", ()) or ())
+            if not modes:
+                continue
+            best_index = max(range(len(modes)), key=lambda index: modes[index].probability)
+            color = palette[target_index % len(palette)]
+            for mode_index, mode in enumerate(modes):
+                pixels = [world_to_pixel(point.x, point.y) for point in mode.points]
+                if len(pixels) < 2:
+                    continue
+                is_best = mode_index == best_index
+                line_color = color if is_best else tuple(int(channel * 0.42) for channel in color)
+                cv2.polylines(
+                    img,
+                    [np.asarray(pixels, dtype=np.int32)],
+                    False,
+                    line_color,
+                    3 if is_best else 1,
+                    cv2.LINE_AA,
+                )
+
+            best_mode = modes[best_index]
+            endpoint = best_mode.points[-1]
+            end_pixel = world_to_pixel(endpoint.x, endpoint.y)
+            cv2.circle(img, end_pixel, 4, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                img,
+                f"#{track_id} {best_mode.probability:.2f}",
+                (end_pixel[0] + 5, end_pixel[1] - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
 
     def _draw_left_panel(self, draw: ImageDraw.ImageDraw, result, w, h):
         """画左侧信息栏（PIL 中文）。"""
@@ -259,8 +344,20 @@ class UnifiedUI:
         y += line_h + 5
 
         # QCNet
-        if result.qcnet_ready:
-            draw.text((x, y), "轨迹预测: 就绪", fill=(0, 255, 0), font=self.font_normal)
+        if result.qcnet_active:
+            model_count = len(result.qcnet_predictions)
+            fallback_count = sum(
+                1 for rr in result.risk_results
+                if rr.prediction_source == "constant_velocity"
+            )
+            label = f"QCNet运行: {model_count}目标"
+            if fallback_count:
+                label += f" / 回退{fallback_count}"
+            draw.text((x, y), label, fill=(0, 255, 0), font=self.font_small)
+        elif result.qcnet_ready and result.qcnet_error:
+            draw.text((x, y), "轨迹预测: 匀速降级", fill=(255, 180, 0), font=self.font_small)
+        elif result.qcnet_ready:
+            draw.text((x, y), "轨迹预测: 等待有效目标", fill=(0, 200, 255), font=self.font_small)
         else:
             draw.text((x, y), f"预热中 {result.qcnet_history_frames}/{QCNET_MIN_HISTORY}",
                       fill=(0, 200, 255), font=self.font_normal)
