@@ -128,15 +128,15 @@ predictor.close()
 ### 实时 BEV 接口
 
 ```python
-from qcnet_ego import BEVFrame, EgoState, ObjectState, EgoTrajectoryPredictor
+from qcnet_ego import BEVFrame, EgoState, ObjectState, RealtimeTrajectoryPredictor
 
-predictor = EgoTrajectoryPredictor(
+predictor = RealtimeTrajectoryPredictor(
     'checkpoints/QCNet_Ego_2s_best.ckpt', device='cuda'
 )
 
 for frame in realtime_bev_frames:
     result = predictor.update(frame)
-    if result is not None:  # 收齐最近 50 帧后，每个新帧产生一次预测
+    if result is not None:  # 至少两个有效采样后，每个新帧产生一次预测
         consume(result.trajectories, result.probabilities)
 ```
 
@@ -150,12 +150,12 @@ for frame in realtime_bev_frames:
 | `ego` | `EgoState` | 必须包含且 ID 在同一流中稳定 |
 | `objects` | `Sequence[ObjectState]` | 当前帧可见目标 |
 
-`EgoState` 和 `ObjectState` 都包含 `id`、`type`、`position=(x,y)`、
-`velocity=(vx,vy)`、`heading`。`type` 可使用类型名或 0–9 的类型编号。
+`EgoState` 包含 `id`、`position=[x,y]`、`velocity=[vx,vy]`、`heading`；自车类型固定映射为
+vehicle。`ObjectState` 另含 `type`，支持规定类型名；无法识别的类别统一映射为 unknown。
 
-`HistoryBuffer` 按 object ID 保存最近 50 帧。最新帧存在的目标进入当前模型输入；目标在
-历史中缺失的采样由零值占位并令 `valid_mask=False`。前 49 帧 `update()` 返回 `None`，
-第 50 帧开始返回 `PredictionResult`。新序列开始前调用 `predictor.reset_history()`。
+`BEVHistoryBuffer` 按 object ID 保存最近 50 帧。历史中缺失的采样由零值占位并令
+`valid_mask=False`；不足 50 帧时在左侧补 invalid。第 1 帧 `update()` 返回 `None`，AV 达到
+两个有效采样后即可预测，不要求等满 50 帧。新序列开始前调用 `predictor.reset_history()`。
 刚出现且只有一个有效采样的目标会被暂缓，不影响其他目标预测；获得第二个有效采样后自动
 进入模型和输出。输出的 `agent_ids`/`agent_indices` 是本次实际预测对象的对应关系。
 
@@ -163,7 +163,8 @@ for frame in realtime_bev_frames:
 BEV/定位上游预先表达在同一个固定预测参考 Ego frame。不能直接把“每帧各自以当时 AV 为
 原点”的 50 组数值拼接起来；那会形成随时间变化的坐标系，与模型训练输入不一致。若 BEV
 只输出逐帧当前 Ego frame，上游必须先借助 ego pose/里程计把历史窗口统一重表达，再调用
-本接口。`demo_bev_input.py` 使用静止 AV，因此其 50 帧天然共享同一参考 frame，仅用于接口
+本接口。坐标转换可通过 `CoordinateWindowAdapter` 插件接入；默认 identity adapter 不做变换。
+`demo_bev_input.py` 使用静止 AV，因此其 50 帧天然共享同一参考 frame，仅用于接口
 与 tensor shape 验证，不代表真实预测质量。**
 
 ## 7. 输入字段、shape 与 dtype

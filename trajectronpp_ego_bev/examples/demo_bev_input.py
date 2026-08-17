@@ -8,7 +8,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from qcnet_ego import BEVFrame, EgoState, EgoTrajectoryPredictor, ObjectState
+from qcnet_ego import BEVFrame, EgoState, ObjectState, RealtimeTrajectoryPredictor
 
 
 def create_frame(frame_index: int) -> BEVFrame:
@@ -19,26 +19,26 @@ def create_frame(frame_index: int) -> BEVFrame:
         timestamp=time_seconds,
         coordinate_frame='ego',
         ego=EgoState(
-            id='AV', type='vehicle', position=(0.0, 0.0),
-            velocity=(0.0, 0.0), heading=0.0,
+            id='AV', position=[0.0, 0.0],
+            velocity=[0.0, 0.0], heading=0.0,
         ),
-        objects=(
+        objects=[
             ObjectState(
                 id='vehicle_front', type='vehicle',
-                position=(12.0 + 1.5 * time_seconds, 1.5),
-                velocity=(1.5, 0.0), heading=0.0,
+                position=[12.0 + 1.5 * time_seconds, 1.5],
+                velocity=[1.5, 0.0], heading=0.0,
             ),
             ObjectState(
                 id='vehicle_left', type='vehicle',
-                position=(5.0 + 0.8 * time_seconds, 4.0),
-                velocity=(0.8, 0.0), heading=0.0,
+                position=[5.0 + 0.8 * time_seconds, 4.0],
+                velocity=[0.8, 0.0], heading=0.0,
             ),
             ObjectState(
                 id='pedestrian_right', type='pedestrian',
-                position=(8.0, -5.0 + 0.5 * time_seconds),
-                velocity=(0.0, 0.5), heading=1.5707963267948966,
+                position=[8.0, -5.0 + 0.5 * time_seconds],
+                velocity=[0.0, 0.5], heading=1.5707963267948966,
             ),
-        ),
+        ],
     )
 
 
@@ -51,16 +51,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    predictor = EgoTrajectoryPredictor(args.checkpoint, device=args.device)
+    predictor = RealtimeTrajectoryPredictor(args.checkpoint, device=args.device)
     result = None
     for frame_index in range(50):
         result = predictor.update(create_frame(frame_index))
-        if frame_index < 49:
+        if frame_index == 0:
             assert result is None
 
     if result is None:
         raise RuntimeError('No prediction was produced after 50 frames.')
-    print('Buffered frames:', predictor.history_buffer.size)
+    print('Buffered frames:', predictor.history_buffer.num_frames)
     print('Input agents: 4')
     print('Output trajectories:', list(result.trajectories.shape))
     print('Output probabilities:', list(result.probabilities.shape))

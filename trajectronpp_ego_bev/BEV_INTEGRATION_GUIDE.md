@@ -82,20 +82,19 @@ frame = BEVFrame(
     coordinate_frame="ego",
     ego=EgoState(
         id="AV",
-        type="vehicle",
-        position=(0.0, 0.0),
-        velocity=(0.0, 0.0),
+        position=[0.0, 0.0],
+        velocity=[0.0, 0.0],
         heading=0.0,
     ),
-    objects=(
+    objects=[
         ObjectState(
             id="track_42",
             type="vehicle",
-            position=(15.2, 1.3),
-            velocity=(3.1, 0.1),
+            position=[15.2, 1.3],
+            velocity=[3.1, 0.1],
             heading=0.04,
         ),
-    ),
+    ],
 )
 ```
 
@@ -103,18 +102,18 @@ frame = BEVFrame(
 
 | 字段 | 类型 | 必填 | 约束 |
 |---|---|---:|---|
-| `frame_id` | 可哈希对象 | 是 | 用于上游日志追踪 |
+| `frame_id` | int | 是 | 用于上游日志追踪 |
 | `timestamp` | float | 是 | 秒；严格递增；相邻约 0.1 秒 |
 | `coordinate_frame` | str | 是 | 必须为 `"ego"` |
 | `ego` | `EgoState` | 是 | 每帧必须包含 |
-| `objects` | `Sequence[ObjectState]` | 是 | 可为空，不包含 AV |
+| `objects` | `List[ObjectState]` | 是 | 可为空，不包含 AV |
 
 ### EgoState / ObjectState
 
 | 字段 | 类型 | 单位 | 约束 |
 |---|---|---|---|
-| `id` | 可哈希对象 | - | 流内稳定；不得与其他目标重复 |
-| `type` | str 或 int | - | 类型名或 0–9 类型索引 |
+| `id` | Ego 为 str；目标为 str/int | - | 流内稳定；不得与其他目标重复 |
+| `type` | ObjectState 专有 str | - | 识别失败自动映射 unknown；Ego 固定为 vehicle |
 | `position` | 长度 2 数值序列 | m | `[x,y]`，有限值 |
 | `velocity` | 长度 2 数值序列 | m/s | `[vx,vy]`，有限值 |
 | `heading` | float | rad | 有限值，接口 wrap 到 `[-pi,pi]` |
@@ -127,23 +126,19 @@ pedestrian=1
 motorcyclist=2
 cyclist=3
 bus=4
-static=5
-background=6
-construction=7
-riderless_bicycle=8
 unknown=9
 ```
 
-未知类别应由 BEV 组显式映射为 `"unknown"`，不要传入任意新字符串。
+无法识别的类别会在接口层统一映射为 `unknown=9`；仍建议 BEV 组主动使用规定类型名，便于日志审计。
 
 ## 5. 两组组合时的方法调用
 
 ### 5.1 服务启动：预测组调用一次
 
 ```python
-from qcnet_ego import EgoTrajectoryPredictor
+from qcnet_ego import RealtimeTrajectoryPredictor
 
-predictor = EgoTrajectoryPredictor(
+predictor = RealtimeTrajectoryPredictor(
     checkpoint_path="checkpoints/QCNet_Ego_2s_best.ckpt",
     device="cuda",
     return_cpu=True,
@@ -156,9 +151,9 @@ predictor = EgoTrajectoryPredictor(
 2. 严格加载模型权重。
 3. 将模型放到指定设备。
 4. 执行 `model.eval()`。
-5. 创建空的 50 帧 `HistoryBuffer`。
+5. 创建空的 50 帧 `BEVHistoryBuffer`。
 
-不要每帧重新创建 predictor，否则会反复加载模型并永久无法积满历史窗口。
+不要每帧重新创建 predictor，否则会反复加载模型并丢失 Track 历史。
 
 ### 5.2 实时循环：BEV 组每 0.1 秒提交一次
 
@@ -168,8 +163,9 @@ result = predictor.update(bev_frame)
 
 方法返回规则：
 
-- 第 1–49 帧：返回 `None`，表示历史窗口尚未就绪。
-- 第 50 帧及以后：缓存更新后立即执行一次 QCNet 推理并返回 `PredictionResult`。
+- 第 1 帧：返回 `None`，因为运动预测至少需要两个有效采样。
+- 第 2 帧及以后：AV 达到两个有效采样后立即执行一次 QCNet 推理，不要求等满 50 帧。
+- 历史不足 50 帧的左侧时刻自动补零并标记 `valid_mask=False`。
 - 每次调用滑动保留最新 50 帧。
 
 典型组合代码：
@@ -184,7 +180,7 @@ def on_bev_frame(bev_frame: BEVFrame) -> None:
 
     if result is None:
         report_warming_up(
-            current=predictor.history_buffer.size,
+            current=predictor.history_buffer.num_frames,
             required=50,
         )
         return
@@ -255,16 +251,16 @@ predictor.close()
 ```text
 预测服务启动
     │
-    ├─ EgoTrajectoryPredictor(checkpoint, device) ── 模型严格加载一次
+    ├─ RealtimeTrajectoryPredictor(checkpoint, device) ── 模型严格加载一次
     │
 BEV 组 10 Hz 回调
     │
     ├─ 构造 BEVFrame
     ├─ predictor.update(frame)
     │       ├─ 输入校验
-    │       ├─ HistoryBuffer.update
-    │       ├─ 历史不足 50 帧 → None
-    │       └─ 历史达到 50 帧
+    │       ├─ BEVHistoryBuffer.update
+    │       ├─ 只有一个 AV 采样 → None
+    │       └─ 至少两个 AV 采样
     │              ├─ to_qcnet_input
     │              ├─ model.eval + torch.inference_mode
     │              └─ PredictionResult
@@ -306,7 +302,7 @@ BEV 组 10 Hz 回调
 - 默认允许误差：±0.03 秒。
 - timestamp 必须严格递增。
 - 超出误差时接口抛出 `ValueError`，不自动插值或重采样。
-- 当前 predictor/HistoryBuffer 为有状态对象，不保证并发线程安全。
+- 当前 predictor/BEVHistoryBuffer 为有状态对象，不保证并发线程安全。
 - 同一 predictor 应由单一有序消费循环调用。
 - 多路独立场景应分别创建 predictor；不要把不同 scenario 的 frame 混入同一个缓存。
 
@@ -376,7 +372,7 @@ python -B examples\demo_bev_input.py --device cuda
 - 10 Hz 时间戳单调。
 - AV t0 pose 合法。
 - ID 连续。
-- 第 50 帧开始得到 `[P,6,20,2]` 和 `[P,6]`。
+- 第 2 帧开始可得到预测；第 50 帧检查完整窗口 shape 和 valid mask。
 - 概率每行和约为 1。
 - `agent_ids` 与可视化目标一致。
 
