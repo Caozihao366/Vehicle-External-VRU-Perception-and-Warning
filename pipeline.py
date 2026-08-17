@@ -52,6 +52,10 @@ class FrameResult:
     # QCNet 状态
     qcnet_ready: bool = False
     qcnet_history_frames: int = 0
+    qcnet_loaded: bool = False
+    qcnet_active: bool = False
+    qcnet_error: str = ""
+    qcnet_predictions: dict = field(default_factory=dict)
 
     # 处理延迟
     process_ms: float = 0.0
@@ -166,6 +170,7 @@ class Pipeline:
         # QCNet（延迟加载，需要 torch_geometric）
         self._qcnet = None
         self._qcnet_tried = False
+        self._qcnet_error = ""
 
         self._prev_time = None
         print("[pipeline] 初始化完成。")
@@ -292,7 +297,15 @@ class Pipeline:
                         )
             except Exception as e:
                 print(f"[pipeline] QCNet 推理异常，使用匀速模型: {e}")
+                self._qcnet_error = str(e)
                 qcnet_predictions = None
+
+        # 保留本帧真实推理状态与轨迹，供可选UI读取。
+        # qcnet_ready仅代表历史足够，qcnet_active才代表模型实际产生了轨迹。
+        result.qcnet_loaded = self._qcnet is not None
+        result.qcnet_predictions = qcnet_predictions or {}
+        result.qcnet_active = bool(result.qcnet_predictions)
+        result.qcnet_error = self._qcnet_error
 
         # ---- 7. TTC 风险评估 ----
         result.risk_results = self.ttc.evaluate(
@@ -314,10 +327,13 @@ class Pipeline:
                 package_root=QCNET_DIR,
                 device=QCNET_DEVICE,
             )
+            self._qcnet_error = ""
             print("[pipeline] QCNet 模型加载成功（多模态轨迹预测）。")
         except ImportError as e:
+            self._qcnet_error = str(e)
             print(f"[pipeline] torch_geometric 未安装，QCNet 不可用，TTC 使用匀速模型: {e}")
         except Exception as e:
+            self._qcnet_error = str(e)
             print(f"[pipeline] QCNet 初始化失败: {e}")
 
     def release(self):
