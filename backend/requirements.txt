@@ -1,0 +1,10 @@
+# Unified Windows runtime (Python 3.10, CUDA 11.8).
+# PyTorch/PyG wheels and NumPy are pinned by the QCNet requirement file.
+-r ttc/requirements-qcnet-cu118.txt
+
+# Perception, tracking, visualization, and wrong-way modules.
+opencv-python>=4.8,<4.12
+Pillow>=9.5
+torchvision==0.15.2+cu118
+ultralytics>=8.2,<8.5
+lap>=0.5.12
