@@ -42,7 +42,7 @@ CAMERA_ID = 0
 DET_CLASSES = [0, 1, 2, 3, 5, 7]
 DET_CONF = 0.3
 DET_DEVICE = 0          # GPU; 改为 "cpu" 可强制 CPU
-DET_HALF = True
+DET_HALF = False
 
 # vru 行为分析只关心 VRU 类别
 VRU_BEHAVIOR_CLASSES = {0, 1, 3}
@@ -82,7 +82,7 @@ EGO_WIDTH_M = 2.0
 # ============================================================
 # QCNet 轨迹预测
 # ============================================================
-QCNET_DEVICE = "cuda"
+QCNET_DEVICE = "cpu"
 QCNET_FREQUENCY_HZ = 10.0
 QCNET_HISTORY_STEPS = 50     # 5 秒历史
 QCNET_HORIZON_S = 2.0

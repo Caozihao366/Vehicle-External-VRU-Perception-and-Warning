@@ -13,13 +13,16 @@ from typing import List, Optional
 
 import cv2
 import numpy as np
+import torch
 
 from system_config import *
 from vru_perception import VRUPerception
 from wrong_way_adapter import WrongWayAdapter
 from ground_plane import GroundPlaneProjector
-from history_buffer import HistoryBuffer
 from ttc_engine import TTCEngine, RiskResult
+from bev_undistort_pipeline3.async_trajectory_predictor import (
+    AsyncTrajectoryPredictor,
+)
 
 
 @dataclass
@@ -154,15 +157,12 @@ class Pipeline:
             min_dist_m=MIN_PROJECTION_DIST_M,
         )
 
-        print("[pipeline] 初始化历史缓冲...")
-        self.history = HistoryBuffer()
-
         print("[pipeline] 初始化 TTC 引擎...")
         self.ttc = TTCEngine()
 
-        # QCNet（延迟加载，需要 torch_geometric）
-        self._qcnet = None
-        self._qcnet_tried = False
+        # QCNet 只在这里初始化一次；逐帧 forward 由独立线程执行。
+        self._trajectory_predictor = None
+        self._start_trajectory_predictor()
 
         self._prev_time = None
         print("[pipeline] 初始化完成。")
@@ -239,29 +239,27 @@ class Pipeline:
         result.bev_frame = bev_frame
         result.projected = projected
 
-        # ---- 5. 历史缓冲 ----
-        self.history.append(bev_frame)
-        result.qcnet_history_frames = len(self.history)
-        result.qcnet_ready = self.history.ready(QCNET_MIN_HISTORY)
-
-        # ---- 6. QCNet 轨迹预测（如果可用）----
+        # ---- 5. 异步 QCNet 轨迹预测 ----
         qcnet_predictions = None
-        if result.qcnet_ready and not self._qcnet_tried:
-            self._init_qcnet()
-        if self._qcnet is not None and result.qcnet_ready:
+        if self._trajectory_predictor is not None:
             try:
-                qcnet_input = self.history.build_qcnet_input()
-                if qcnet_input is not None:
-                    target_ids = [str(p.track_id) for p in projected]
-                    if target_ids:
-                        qcnet_predictions = self._qcnet.predict(
-                            qcnet_input, target_ids=target_ids
-                        )
-            except Exception as e:
-                print(f"[pipeline] QCNet 推理异常，使用匀速模型: {e}")
-                qcnet_predictions = None
+                # submit() 只入队，不在 BEV 主线程中执行模型 forward。
+                self._trajectory_predictor.submit(bev_frame)
+                packet = self._trajectory_predictor.get_latest()
+                if packet is not None:
+                    qcnet_predictions = packet.result
+                    result.qcnet_ready = True
 
-        # ---- 7. TTC 风险评估 ----
+                result.qcnet_history_frames = (
+                    self._trajectory_predictor.history_frames
+                )
+                error = self._trajectory_predictor.get_latest_error()
+                if error is not None:
+                    print(f"[pipeline] QCNet 异步推理异常，使用匀速模型: {error}")
+            except (TypeError, RuntimeError) as e:
+                print(f"[pipeline] QCNet 预测线程不可用，使用匀速模型: {e}")
+
+        # ---- 6. TTC 风险评估 ----
         result.risk_results = self.ttc.evaluate(
             bev_frame, projected,
             qcnet_predictions=qcnet_predictions,
@@ -272,21 +270,47 @@ class Pipeline:
         result.process_ms = (time.time() - t_start) * 1000
         return result
 
-    def _init_qcnet(self):
-        """延迟初始化 QCNet（需要 torch_geometric）。"""
-        self._qcnet_tried = True
-        try:
-            from ttc.integrations.qcnet import QCNetTrajectoryProvider
-            self._qcnet = QCNetTrajectoryProvider(
-                package_root=QCNET_DIR,
-                device=QCNET_DEVICE,
+    def _start_trajectory_predictor(self):
+        """Load QCNet once and start its prediction worker."""
+
+        # The current monocular projector emits each frame in that frame's Ego
+        # coordinates and has no global pose/delta with which to express all
+        # history in the latest fixed t0 frame. Per the QCNet coordinate
+        # contract, only static-ego data is valid until that pose is supplied.
+        if abs(self.ego_speed) > 1e-6 or abs(self.ego_yaw_rate) > 1e-6:
+            print(
+                "[pipeline] 当前 BEV 未提供固定 t0 Ego 坐标转换，"
+                "非静止自车场景禁用 QCNet，TTC 使用匀速模型。"
             )
-            print("[pipeline] QCNet 模型加载成功（多模态轨迹预测）。")
+            return
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            predictor = AsyncTrajectoryPredictor(
+                checkpoint_path=str(QCNET_CHECKPOINT),
+                device=device,
+            )
+            predictor.start()
+            self._trajectory_predictor = predictor
+            print(f"[pipeline] QCNet 异步轨迹预测已在 {device} 上启动。")
         except ImportError as e:
             print(f"[pipeline] torch_geometric 未安装，QCNet 不可用，TTC 使用匀速模型: {e}")
         except Exception as e:
             print(f"[pipeline] QCNet 初始化失败: {e}")
 
+    def reset_history(self):
+        """Reset QCNet history after a scene, localization, or MOT reset."""
+
+        if self._trajectory_predictor is not None:
+            self._trajectory_predictor.reset_history()
+
     def release(self):
+        if self._trajectory_predictor is not None:
+            try:
+                self._trajectory_predictor.stop()
+            except RuntimeError as e:
+                print(f"[pipeline] QCNet 预测线程停止失败: {e}")
+            finally:
+                self._trajectory_predictor = None
         if self._image_list is None:
             self.cap.release()
