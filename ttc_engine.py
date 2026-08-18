@@ -101,6 +101,7 @@ class TTCEngine:
         qcnet_predictions: Optional[dict] = None,
         ego_speed_mps: float = 0.0,
         ego_yaw_rate_rps: float = 0.0,
+        sensor_status: str = "normal",
     ) -> List[RiskResult]:
         """
         评估所有目标的碰撞风险。
@@ -111,6 +112,7 @@ class TTCEngine:
             qcnet_predictions: dict {track_id_str: QCNetTargetPrediction}（可选）
             ego_speed_mps: 自车速度
             ego_yaw_rate_rps: 自车横摆角速度
+            sensor_status: 上游传感器质量状态
 
         Returns:
             list[RiskResult]
@@ -123,6 +125,13 @@ class TTCEngine:
 
         # 自车 CTRV 轨迹（多模态 TTC 用）
         ego_traj = build_ego_trajectory(ego, horizon_s=self.horizon_s, dt_s=self.dt_s)
+        sensor_availability = {
+            "normal": "available",
+            "partial": "degraded",
+            "degraded": "degraded",
+            "unavailable": "unavailable",
+            "unknown": "degraded",
+        }.get(sensor_status, "degraded")
 
         results = []
         active_ids = set()
@@ -131,7 +140,8 @@ class TTCEngine:
             tid = obj.track_id
             active_ids.add(tid)
             behavior = obj.behavior if obj.behavior in (
-                "normal", "running", "falling", "wrong_way", "uncertain"
+                "normal", "running", "falling", "suspect_wrong_way",
+                "wrong_way", "uncertain"
             ) else "normal"
 
             ttc_s = None
@@ -152,7 +162,7 @@ class TTCEngine:
                         modes=qcnet_pred.modes,
                         prediction_source=qcnet_pred.prediction_source,
                         behavior_state=behavior,
-                        sensor_availability="available",
+                        sensor_availability=sensor_availability,
                         dt_s=self.dt_s,
                         ego_length_m=self.ego_length_m,
                         ego_width_m=self.ego_width_m,

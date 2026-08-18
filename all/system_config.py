@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 
 VRU_DIR = ROOT_DIR / "vru识别与姿态判定"
-FR05_DIR = ROOT_DIR / "fr05_wrongway"
+FR05_DIR = ROOT_DIR.parent / "fr05"
 SENSOR_QUALITY_DIR = ROOT_DIR / "sensor_quality"
 TTC_DIR = ROOT_DIR / "ttc"
 QCNET_DIR = ROOT_DIR / "trajectronpp_ego_bev"

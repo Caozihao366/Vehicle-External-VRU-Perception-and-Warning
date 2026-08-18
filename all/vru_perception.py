@@ -27,7 +27,6 @@ _vru_cfg.FIXED_CAMERA = False
 
 from ego_motion import EgoMotionEstimator      # noqa: E402
 from vru_tracker import VRUTracker             # noqa: E402
-from behavior_analyzer import BehaviorAnalyzer  # noqa: E402
 
 # 清理 sys.path（避免污染其他模块导入）
 sys.path.remove(str(_VRU_DIR))
@@ -35,7 +34,9 @@ sys.path.remove(str(_VRU_DIR))
 
 class VRUPerception:
     """
-    VRU 检测 + 跟踪 + 姿态 + 异常行为（奔跑/跌倒）。
+    VRU 检测 + 跟踪 + 姿态特征提取。
+
+    异常行为统一交由 fr05.FR05Recognizer 处理。
 
     用法:
         perc = VRUPerception()
@@ -64,7 +65,6 @@ class VRUPerception:
 
         self.ego_estimator = EgoMotionEstimator()
         self.tracker = VRUTracker()
-        self.behavior_analyzer = BehaviorAnalyzer()
 
         self._prev_time = None
 
@@ -94,6 +94,7 @@ class VRUPerception:
 
         bg_mask = np.ones(gray.shape, dtype=np.uint8) * 255
         boxes_data = []
+        detection_confidence = {}
         keypoints_data = {}
         count = {}
 
@@ -101,10 +102,14 @@ class VRUPerception:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             ids = results[0].boxes.id.cpu().numpy().astype(int)
             clses = results[0].boxes.cls.cpu().numpy().astype(int)
+            confidences = results[0].boxes.conf.cpu().numpy()
 
-            for box, track_id, cls in zip(boxes, ids, clses):
+            for box, track_id, cls, confidence in zip(
+                boxes, ids, clses, confidences
+            ):
                 x1, y1, x2, y2 = map(int, box)
                 boxes_data.append((x1, y1, x2, y2, track_id, cls))
+                detection_confidence[track_id] = float(confidence)
                 count[_vru_cfg.CLASS_NAMES.get(cls, str(cls))] = \
                     count.get(_vru_cfg.CLASS_NAMES.get(cls, str(cls)), 0) + 1
 
@@ -145,26 +150,10 @@ class VRUPerception:
             self.ego_estimator.bg_pts_curr,
             self.ego_estimator.bg_residual_px,
         )
-
-        # ---- 人车绑定 ----
-        BehaviorAnalyzer.bind_rider_to_vehicle(tracks)
-
-        # ---- 异常行为分析（仅 VRU 类） ----
         for obj in tracks:
-            if obj.get("is_rider", False):
-                obj["behavior"] = "normal"
-                obj["behavior_conf"] = 1.0
-                continue
-            if obj["cls"] in (0, 1, 3):
-                behavior, conf = self.behavior_analyzer.analyze(obj, dt, h, w)
-                obj["behavior"] = behavior
-                obj["behavior_conf"] = conf
-            else:
-                obj["behavior"] = "normal"
-                obj["behavior_conf"] = 1.0
-
-        # 跌倒记忆池（ghost targets）
-        tracks.extend(self.behavior_analyzer.get_active_ghosts())
+            obj["conf"] = detection_confidence.get(
+                obj["track_id"], obj.get("conf", 0.0)
+            )
 
         ego_motion = {
             "M_smooth": M_smooth,

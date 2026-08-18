@@ -143,6 +143,15 @@ def build_message(result) -> Dict[str, Any]:
             "behavior": {
                 "state": _BEHAVIOR_CODE.get(behavior, "NORMAL"),
                 "confidence": round(float(behavior_conf), 3),
+                "source": obj.get("behavior_source", "none"),
+                "evidence": {
+                    "orient_face": obj.get("orient_face"),
+                    "orient_confidence": round(
+                        float(obj.get("orient_conf", 0.0)), 3
+                    ),
+                    "ego_lane_relation": obj.get("ego_relation"),
+                    "decision_source": obj.get("decision_source"),
+                },
             },
             "prediction": prediction,
             "risk": risk_info,
@@ -159,6 +168,19 @@ def build_message(result) -> Dict[str, Any]:
             getattr(result, "qcnet_predictions", {}) or {}
         ),
         "qcnet_history_frames": result.qcnet_history_frames,
+        "fr05_latency_ms": round(
+            float(getattr(result, "fr05_latency_ms", 0.0)), 3
+        ),
+    }
+
+    fr05_info = {
+        "status": getattr(result, "fr05_status", "unavailable"),
+        "capabilities": getattr(result, "fr05_capabilities", {}),
+        "warnings": getattr(result, "fr05_warnings", []),
+        "events": [
+            event.to_dict() if hasattr(event, "to_dict") else event
+            for event in getattr(result, "fr05_events", [])
+        ],
     }
 
     return {
@@ -166,6 +188,7 @@ def build_message(result) -> Dict[str, Any]:
         "frame_id": result.frame_id,
         "ego_status": ego_status,
         "sensor_availability": sensor_info,
+        "fr05": fr05_info,
         "vru_objects": vru_objects,
         "performance": performance,
     }

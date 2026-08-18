@@ -77,7 +77,10 @@ def classify_risk(
     warning_ttc_s: float = 2.5,
 ) -> tuple[str, str]:
     """Return the document-defined risk enum and its primary reason."""
-    allowed_behaviors = {"normal", "running", "falling", "wrong_way", "uncertain"}
+    allowed_behaviors = {
+        "normal", "running", "falling", "suspect_wrong_way",
+        "wrong_way", "uncertain",
+    }
     if behavior_state not in allowed_behaviors:
         raise ValueError(
             f"behavior_state must be one of {', '.join(sorted(allowed_behaviors))}"
@@ -103,6 +106,7 @@ def classify_risk(
         "normal": 1.0,
         "running": 1.25,
         "falling": 1.0,
+        "suspect_wrong_way": 1.05,
         "wrong_way": 1.15,
         "uncertain": 1.10,
     }[behavior_state]

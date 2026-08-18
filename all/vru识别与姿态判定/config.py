@@ -1,5 +1,3 @@
-import cv2
-import numpy as np
 # ==================== 通用开关 ====================
 FIXED_CAMERA = True          # 固定相机测试视频开，实时摄像头关
 # ==================== YOLO与类别 ====================
@@ -69,24 +67,3 @@ TRACK_STATE_STABLE = 1
 TRACK_STATE_LOST = 2
 OBJ_KF_PROCESS_NOISE = 0.1
 OBJ_KF_MEASURE_NOISE = 1.0
-# ==================== 异常行为识别参数 ====================
-RUN_ACCEL_THRESH = 0.4
-RUN_SPEED_THRESH = 0.8
-RUN_CONFIRM_FRAMES = 3
-# 跌倒识别（提前触发）
-FALL_TORSO_ANGLE = 40
-FALL_HW_RATIO = 1.6
-FALL_VERTICAL_SPEED = 1.0
-FALL_CONFIRM_FRAMES = 1
-# 逆行预留
-WRONG_WAY_ANGLE_THRESH = 150
-WRONG_WAY_CONFIRM_FRAMES = 30
-# 二轮车行为阈值
-BIKE_FALL_HW_RATIO = 1.2
-BIKE_FALL_TORSO_ANGLE = 45
-BIKE_ACCEL_THRESH = 1.5
-MOTO_ACCEL_THRESH = 2.0
-BIKE_SPEED_THRESH = 1.2
-MOTO_SPEED_THRESH = 1.5
-# ==================== 显示 ====================
-WINDOW_NAME = "VRU异常行为检测"

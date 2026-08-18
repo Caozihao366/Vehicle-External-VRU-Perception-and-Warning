@@ -253,6 +253,22 @@ class UnifiedUI:
         draw.text((x, y), f"质量分: {result.sensor_score:.2f}", fill=(200, 200, 200), font=self.font_small)
         y += line_h + 5
 
+        # FR-05
+        fr05_status = getattr(result, "fr05_status", "unavailable")
+        fr05_cn = {
+            "available": "正常",
+            "degraded": "降级",
+            "unavailable": "不可用",
+        }.get(fr05_status, fr05_status)
+        fr05_color = (0, 255, 0) if fr05_status == "available" else (255, 180, 0)
+        draw.text(
+            (x, y),
+            f"FR05: {fr05_cn} {getattr(result, 'fr05_latency_ms', 0.0):.1f}ms",
+            fill=fr05_color,
+            font=self.font_small,
+        )
+        y += line_h + 5
+
         # 自车
         draw.text((x, y), f"自车速度: {self.ego_speed_kmh(result):.0f} km/h",
                   fill=(255, 255, 255), font=self.font_normal)
