@@ -1,0 +1,21 @@
+{
+  "model_name": "QCNet_Ego_2s",
+  "model_family": "QCNet",
+  "coordinate_mode": "ego",
+  "reference_time": "history_last_t0",
+  "use_map": false,
+  "use_ego_relative": true,
+  "history_steps": 50,
+  "history_seconds": 5.0,
+  "internal_future_steps": 60,
+  "output_future_steps": 20,
+  "output_future_seconds": 2.0,
+  "frequency_hz": 10.0,
+  "num_modes": 6,
+  "checkpoint": "checkpoints/QCNet_Ego_2s_best.ckpt",
+  "validation_subset_size": 5000,
+  "val_minADE_m": 0.7800710797,
+  "val_minFDE_m": 0.8871588707,
+  "val_MR": 0.121799998,
+  "notes": "Metrics are from a fixed 5000-scenario AV2 validation subset, not the full official benchmark."
+}

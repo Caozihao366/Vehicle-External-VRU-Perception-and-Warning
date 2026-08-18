@@ -1,0 +1,27 @@
+model:
+  family: QCNet
+  num_historical_steps: 50
+  internal_num_future_steps: 60
+  prediction_horizon_steps: 20
+  trajectory_frequency_hz: 10.0
+  num_modes: 6
+  num_recurrent_steps: 3
+  use_ego_relative: true
+  use_map: false
+
+coordinate:
+  input_frame: ego
+  output_frame: ego
+  reference_time: history_last_t0
+  x_axis: forward_at_t0
+  y_axis: left_at_t0
+
+checkpoint:
+  path: checkpoints/QCNet_Ego_2s_best.ckpt
+  strict: true
+  weights_only_initialization: true
+
+runtime:
+  device: cuda
+  return_cpu: true
+  single_scenario_only: true
