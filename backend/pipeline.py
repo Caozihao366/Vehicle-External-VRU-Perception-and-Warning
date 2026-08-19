@@ -2,7 +2,7 @@
 主流水线编排器
 ==============
 串联所有模块:
-  传感器质量 → VRU检测跟踪 → 逆行检测 → 地面投影 → 历史缓冲 → TTC风险
+  传感器质量 → VRU检测跟踪 → FR-05异常行为 → 地面投影 → 轨迹预测 → TTC风险
 
 单路前视视频模式（BEV 退化为 2D 地面平面投影）。
 """
@@ -18,7 +18,7 @@ import torch
 
 from system_config import *
 from vru_perception import VRUPerception
-from wrong_way_adapter import WrongWayAdapter
+from fr05 import FR05Recognizer
 from ground_plane import GroundPlaneProjector
 from history_buffer import HistoryBuffer
 from ttc_engine import TTCEngine, RiskResult
@@ -40,6 +40,13 @@ class FrameResult:
     tracks: list = field(default_factory=list)
     ego_motion: dict = field(default_factory=dict)
     count: dict = field(default_factory=dict)
+
+    # FR-05 异常行为模块
+    fr05_status: str = "unavailable"
+    fr05_events: list = field(default_factory=list)
+    fr05_latency_ms: float = 0.0
+    fr05_capabilities: dict = field(default_factory=dict)
+    fr05_warnings: list = field(default_factory=list)
 
     # 传感器质量
     sensor_status: str = "normal"
@@ -154,14 +161,14 @@ class Pipeline:
             half=det_half,
         )
 
-        if self.enable_wrong_way:
-            print("[pipeline] 初始化逆行检测模块...")
-            self.wrong_way = WrongWayAdapter(
-                device=str(det_device) if det_device != 0 else "cuda",
-                enable_lane=enable_yolopv2,
-            )
-        else:
-            self.wrong_way = None
+        print("[pipeline] 初始化 FR-05 异常行为识别...")
+        self.fr05 = FR05Recognizer(
+            enable_wrong_way=self.enable_wrong_way,
+            enable_lane=enable_yolopv2,
+            device="cpu" if det_device == "cpu" else "auto",
+            orient_weights=str(FR05_ORIENT_WEIGHTS),
+            yolopv2_weights=str(FR05_YOLOPV2_WEIGHTS),
+        )
 
         if self.enable_sensor_quality:
             print("[pipeline] 初始化传感器质量模块...")
@@ -268,18 +275,27 @@ class Pipeline:
                 print(f"[pipeline] 传感器质量检测异常: {e}")
                 result.sensor_status = "unknown"
 
-        # ---- 2. VRU 检测 + 跟踪 + 姿态 + 行为 ----
+        # ---- 2. VRU 检测 + 跟踪 + 姿态特征 ----
         perc_out = self.perception.process_frame(frame, processing_dt)
         result.tracks = perc_out["tracks"]
         result.ego_motion = perc_out["ego_motion"]
         result.count = perc_out["count"]
 
-        # ---- 3. 逆行检测 ----
-        if self.wrong_way is not None:
-            try:
-                self.wrong_way.process_frame(frame, result.tracks, self.frame_id)
-            except Exception as e:
-                print(f"[pipeline] 逆行检测异常: {e}")
+        # ---- 3. FR-05 异常行为（奔跑 / 跌倒 / 逆行）----
+        fr05_output = self.fr05.process_frame(
+            frame,
+            result.tracks,
+            processing_dt,
+            self.frame_id,
+            timestamp=source_timestamp,
+            sensor_status=result.sensor_status,
+        )
+        result.tracks = fr05_output.tracks
+        result.fr05_status = fr05_output.status
+        result.fr05_events = fr05_output.events
+        result.fr05_latency_ms = fr05_output.latency_ms
+        result.fr05_capabilities = fr05_output.capabilities
+        result.fr05_warnings = fr05_output.warnings
 
         # ---- 4. 地面投影 → BEVFrame ----
         bev_frame, projected = self.projector.project_tracks(
@@ -355,6 +371,7 @@ class Pipeline:
             qcnet_predictions=qcnet_predictions or None,
             ego_speed_mps=self.ego_speed,
             ego_yaw_rate_rps=self.ego_yaw_rate,
+            sensor_status=result.sensor_status,
         )
 
         result.process_ms = (time.time() - t_start) * 1000

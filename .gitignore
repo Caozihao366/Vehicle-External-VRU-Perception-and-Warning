@@ -2,3 +2,5 @@ output/
 __pycache__/
 *.pyc
 backend/Ultralytics/
+backend/fr05/weights/*.pt
+backend/fr05/third_party/YOLOPv2/data/weights/*.pt

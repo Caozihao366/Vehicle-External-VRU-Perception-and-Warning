@@ -12,8 +12,9 @@
 - 每条预测模态的独立TTC结果；
 - 可选的相机画面、BEV和离线视频可视化。
 
-模块不负责目标检测、跟踪、像素转米制坐标、时间同步、轨迹模型训练、自车规划或
-车辆制动执行。这些信息由上游感知、BEV、时间同步、轨迹预测和planner提供。
+模块不负责目标检测、跟踪、像素转米制坐标、时间同步、轨迹模型训练或车辆制动执行。
+当前融合版本没有接入planner：自车未来轨迹由速度与横摆率生成CTRV轨迹；目标优先使用
+QCNet多模态轨迹，QCNet不可用或当前目标无有效输出时回退为匀速轨迹。
 
 ## 2. 目录结构
 
@@ -42,7 +43,7 @@ ttc/
 | `core.py` | 轨迹生成、插值、几何净间距、碰撞搜索和多模态TTC |
 | `risk.py` | 风险枚举、行为修正和连续帧风险状态机 |
 | `adapter.py` | 通用JSON/字典接口、参考点转换和时间质量检查 |
-| `integrations/qcnet.py` | 在同一Python进程中加载QCNet并转换为TTC轨迹模态 |
+| `integrations/qcnet.py` | TTC独立调用时可选的QCNet直连适配器；当前融合Pipeline使用异步轨迹预测器 |
 | `visualization.py` | 可选相机画面、米制BEV、多目标排序和MP4写出 |
 | `__main__.py` | `python -m ttc`命令行入口 |
 
@@ -60,7 +61,7 @@ ttc/
 | torch-sparse | 0.6.17+pt20cu118 |
 | torch-cluster | 1.6.1+pt20cu118 |
 | NumPy | 1.26.4 |
-| OpenCV Python | 4.10.0.84 |
+| OpenCV Python | 4.11.0（当前融合环境；TTC独立依赖允许4.10～4.11） |
 
 TTC核心计算只依赖Python标准库。QCNet直连需要PyTorch和PyG；可视化需要NumPy和OpenCV。
 没有使用QCNet或可视化时，不会主动导入这些可选依赖。
@@ -68,8 +69,8 @@ TTC核心计算只依赖Python标准库。QCNet直连需要PyTorch和PyG；可�
 ### 3.1 创建环境
 
 ```powershell
-D:\shixi\Python310\python.exe -m venv D:\shixi\-\.venv310
-D:\shixi\-\.venv310\Scripts\Activate.ps1
+py -3.10 -m venv .venv310
+.\.venv310\Scripts\Activate.ps1
 ```
 
 ### 3.2 安装通用依赖
@@ -95,15 +96,15 @@ python -m pip install -r ttc\requirements-qcnet-cu118.txt
         ↓
 BEV/深度模块提供米制位置
         ↓
-时间同步并维护5秒历史
+按源时间维护历史并重采样到10 Hz
         ↓
-QCNet输出每目标6条未来2秒轨迹
+异步QCNet输出每目标最多6条未来2秒轨迹
         ↓
-integrations/qcnet.py补t=0并转换为PredictionMode
+融合轨迹适配器补t=0并转换为PredictionMode
         ↓
-planner自车轨迹；缺失时使用CTRV
+自车根据速度与横摆率生成CTRV轨迹
         ↓
-逐目标多模态TTC
+逐目标多模态TTC；无模型输出时目标匀速回退
         ↓
 风险状态机
         ↓
@@ -111,6 +112,8 @@ planner自车轨迹；缺失时使用CTRV
 ```
 
 同一帧中的所有有效VRU应分别计算TTC，再统一排序。不要先选一个目标再计算。
+当前融合检测类别为行人、自行车、汽车、摩托车、公交车和卡车；`TTCEngine`会对所有成功
+投影到米制BEV的目标逐个计算，而不是只计算行人或只选择一个最高风险目标。
 
 ## 5. 坐标系与单位
 
@@ -192,7 +195,8 @@ ego_trajectory = build_ego_trajectory(
 )
 ```
 
-如果planner已提供未来轨迹，应直接使用planner轨迹。CTRV只作为planner缺失时的回退。
+当前融合Pipeline实际使用上述CTRV轨迹。公共函数允许未来调用方直接传入其他合法自车轨迹，
+但这属于预留扩展能力，不代表项目已经接入planner。
 
 ### 6.2 多模态TTC
 
@@ -206,15 +210,17 @@ result = compute_multimodal_ttc(
     prediction_source="qcnet_ego_2s_6mode",
     behavior_state=behavior_state,
     sensor_availability=sensor_availability,
-    ego_trajectory_source="local_planner",
+    ego_trajectory_source="ctrv",
 )
 ```
 
 每个目标单独调用一次。相同目标的多条轨迹作为`modes`一次传入。
 
-## 7. QCNet直连接口
+## 7. 可选QCNet直连接口
 
 QCNet在同一个Python 3.10进程中加载，不需要启动另一个虚拟环境、子进程或中间文件。
+本节描述TTC目录自身保留的独立调用能力。当前融合Pipeline实际使用
+`trajectory_predictor.py`异步推理，并把新鲜结果传给`TTCEngine`，不是通过本节示例启动模型。
 
 ```python
 from ttc.integrations import QCNetTrajectoryProvider
@@ -276,15 +282,19 @@ QCNetTargetPrediction(
 
 ## 8. 自车轨迹来源
 
-优先级：
+当前融合版本：
 
 ```text
-planner未来轨迹
-    ↓ 缺失
-CTRV fallback
+自车速度 + 横摆率
+    ↓
+CTRV未来轨迹
 ```
 
-planner轨迹点格式：
+CTRV是当前实际运行基线，并不是已接入的车辆规划器。若未来上游提供同坐标系、同参考时刻
+且从`t=0`开始的可执行规划轨迹，`compute_multimodal_ttc`公共接口可以直接接受该轨迹，
+但当前`Pipeline/TTCEngine`尚未接入这条planner数据通路。
+
+未来可扩展规划轨迹点格式：
 
 ```json
 {"t": 0.1, "x": 0.5, "y": 0.0, "yaw": 0.0}
@@ -292,7 +302,7 @@ planner轨迹点格式：
 
 必须从`t=0`开始，时间严格递增，并与VRU轨迹位于相同参考时刻和坐标系。
 
-QCNet可能同时输出自车预测，但该输出不是车辆可执行planner轨迹，不应默认替代planner。
+QCNet目标预测不能默认替代自车可执行规划轨迹。
 
 ## 9. 轨迹输入约束
 
@@ -392,12 +402,12 @@ safe < notice < warning < danger
 合法行为状态：
 
 ```text
-normal / running / falling / wrong_way / uncertain
+normal / running / falling / suspect_wrong_way / wrong_way / uncertain
 ```
 
 行为状态不会修改物理TTC，只影响风险阈值和触发原因。
 
-连续视频中为每个`track_id`维护一个`RiskStateMachine`：
+连续视频中为每个`track_id`维护一个`RiskStateMachine`（当前默认降级确认3帧、danger保持5帧）：
 
 - 风险升级立即生效；
 - 风险降低需要连续帧确认；
@@ -405,6 +415,8 @@ normal / running / falling / wrong_way / uncertain
 - 目标永久离开后清除对应状态。
 
 ## 13. 输出字段
+
+以下字段属于TTC核心的`MultimodalTTCResult`完整结果对象：
 
 | 字段 | 说明 |
 |---|---|
@@ -421,7 +433,7 @@ normal / running / falling / wrong_way / uncertain
 | `major_trigger_reason` | 主要风险原因 |
 | `requires_aeb` | 给执行层的建议标志 |
 | `status` | 计算和输入状态 |
-| `ego_trajectory_source` | planner来源或ctrv_fallback |
+| `ego_trajectory_source` | 自车轨迹来源；当前融合为CTRV，公共接口允许其他来源标识 |
 | `input_quality` | valid/input_stale等 |
 | `ttc_resolution_ms` | 碰撞搜索分辨率 |
 | `critical_mode_id` | 最早碰撞模态 |
@@ -432,6 +444,11 @@ normal / running / falling / wrong_way / uncertain
 
 `NO_COLLISION_WITHIN_HORIZON`只表示预测时域内未相交，不表示长期绝对安全。
 `requires_aeb`不能直接连接车辆制动执行器。
+
+当前融合GUI/JSON没有原样暴露上述全部核心字段。实际逐目标报文位于
+`vru_objects[].risk`，当前输出`level`、`ttc_ms`、`major_reason`、
+`collision_probability`和`prediction_source`；行为状态位于`vru_objects[].behavior`。
+需要增加核心字段时应修改`message_builder.py`接口文档与消费者，不能仅依据本表假定报文已包含。
 
 ## 14. 时间质量
 
@@ -450,6 +467,10 @@ normal / running / falling / wrong_way / uncertain
 输入过期时仍返回几何结果，但标记`input_stale`，不包装成可信安全结论。
 TTC不自动猜测上游延迟，也不擅自平移预测轨迹。
 
+上述`input_stale`是通用payload适配器语义。当前融合Pipeline对异步QCNet结果采用更直接的
+策略：预测结果相对当前源时间超过0.5秒即不参与本帧TTC，并在该帧回退到目标匀速模型，
+具体原因写入`performance.qcnet_error`。
+
 ## 15. 可选可视化
 
 `visualization.py`只显示已经计算好的结果，不执行轨迹预测或TTC计算。
@@ -457,7 +478,7 @@ TTC不自动猜测上游延迟，也不擅自平移预测轨迹。
 输入：
 
 - 当前相机BGR帧；
-- planner或CTRV自车轨迹；
+- 自车未来轨迹（当前融合为CTRV，公共可视化接口也可显示外部轨迹）；
 - 每个VRU的模型预测模态；
 - 每个VRU的TTC结果；
 - 感知/匹配模块提供的可选相机像素点。
@@ -531,6 +552,8 @@ with TTCVideoWriter("output/ttc_demo.mp4", fps=source_fps) as writer:
 - 预测时域外风险无法由本次计算判断；
 - 风险阈值需要结合实际项目场景标定；
 - 当前V1是基准风险模块，不代表量产车辆安全认证。
+- 当前融合的匀速回退分支使用相对目标速度；传感器状态尚未在该分支中改变物理TTC，
+  因此不能把传感器降级状态理解为已经自动停止全部风险判断。
 
 ## 17. 独立性与依赖
 
